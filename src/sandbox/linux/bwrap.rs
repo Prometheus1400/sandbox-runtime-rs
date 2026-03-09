@@ -115,21 +115,22 @@ fn build_inner_command(
     shell: &str,
 ) -> Result<String, SandboxError> {
     let mut parts = Vec::new();
+    let mut bridge_cmds = Vec::new();
 
     // Set up socat bridges for proxy access
     if let Some(http_sock) = http_socket_path {
         let bridge_cmd = SocatBridge::tcp_to_unix_command(http_proxy_port, http_sock);
-        parts.push(format!("{} &", bridge_cmd));
+        bridge_cmds.push(bridge_cmd);
     }
 
     if let Some(socks_sock) = socks_socket_path {
         let bridge_cmd = SocatBridge::tcp_to_unix_command(socks_proxy_port, socks_sock);
-        parts.push(format!("{} &", bridge_cmd));
+        bridge_cmds.push(bridge_cmd);
     }
 
-    // Small delay to let socat bridges start
-    if http_socket_path.is_some() || socks_socket_path.is_some() {
-        parts.push("sleep 0.1".to_string());
+    // Start proxy bridges in the background, then give them a moment to bind.
+    if !bridge_cmds.is_empty() {
+        parts.push(format!("{} & sleep 0.1", bridge_cmds.join(" & ")));
     }
 
     // Apply seccomp filter and execute command
@@ -173,7 +174,7 @@ fn generate_proxy_env_string(http_port: u16, socks_port: u16) -> String {
     format!(
         "export http_proxy='http://localhost:{}' https_proxy='http://localhost:{}' \
          HTTP_PROXY='http://localhost:{}' HTTPS_PROXY='http://localhost:{}' \
-         ALL_PROXY='socks5://localhost:{}' all_proxy='socks5://localhost:{}' ;",
+         ALL_PROXY='socks5://localhost:{}' all_proxy='socks5://localhost:{}'",
         http_port, http_port, http_port, http_port, socks_port, socks_port
     )
 }
@@ -202,6 +203,27 @@ mod tests {
         let env = generate_proxy_env_string(3128, 1080);
         assert!(env.contains("http_proxy='http://localhost:3128'"));
         assert!(env.contains("ALL_PROXY='socks5://localhost:1080'"));
+        assert!(!env.ends_with(';'));
+    }
+
+    #[test]
+    fn test_build_inner_command_does_not_emit_double_separators() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allow_all_unix_sockets = Some(true);
+
+        let inner = build_inner_command(
+            "echo ok",
+            &config,
+            Some("/tmp/http.sock"),
+            Some("/tmp/socks.sock"),
+            3128,
+            1080,
+            "/bin/bash",
+        )
+        .expect("build_inner_command should succeed");
+
+        assert!(!inner.contains("& ;"), "unexpected '& ;' in: {inner}");
+        assert!(!inner.contains("; ;"), "unexpected '; ;' in: {inner}");
     }
 
     #[test]
