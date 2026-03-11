@@ -43,20 +43,24 @@ pub fn generate_bwrap_command(
     let mut bwrap_args = vec![
         "bwrap".to_string(),
         "--unshare-net".to_string(), // Network isolation
-        "--dev".to_string(),
-        "/dev".to_string(),
-        "--proc".to_string(),
-        "/proc".to_string(),
-        "--tmpfs".to_string(),
-        "/tmp".to_string(),
-        "--tmpfs".to_string(),
-        "/run".to_string(),
     ];
 
-    // Start with read-only root filesystem
+    // Start with read-only root filesystem. This must be mounted before
+    // synthetic mounts like /dev, /proc, and tmpfs paths so those mounts
+    // remain visible and usable in the final namespace.
     bwrap_args.push("--ro-bind".to_string());
     bwrap_args.push("/".to_string());
     bwrap_args.push("/".to_string());
+
+    // Base synthetic filesystems/mounts.
+    bwrap_args.push("--dev".to_string());
+    bwrap_args.push("/dev".to_string());
+    bwrap_args.push("--proc".to_string());
+    bwrap_args.push("/proc".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/tmp".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/run".to_string());
 
     // Add writable mounts
     for mount in &mounts {
@@ -115,21 +119,22 @@ fn build_inner_command(
     shell: &str,
 ) -> Result<String, SandboxError> {
     let mut parts = Vec::new();
+    let mut bridge_cmds = Vec::new();
 
     // Set up socat bridges for proxy access
     if let Some(http_sock) = http_socket_path {
         let bridge_cmd = SocatBridge::tcp_to_unix_command(http_proxy_port, http_sock);
-        parts.push(format!("{} &", bridge_cmd));
+        bridge_cmds.push(bridge_cmd);
     }
 
     if let Some(socks_sock) = socks_socket_path {
         let bridge_cmd = SocatBridge::tcp_to_unix_command(socks_proxy_port, socks_sock);
-        parts.push(format!("{} &", bridge_cmd));
+        bridge_cmds.push(bridge_cmd);
     }
 
-    // Small delay to let socat bridges start
-    if http_socket_path.is_some() || socks_socket_path.is_some() {
-        parts.push("sleep 0.1".to_string());
+    // Start proxy bridges in the background, then give them a moment to bind.
+    if !bridge_cmds.is_empty() {
+        parts.push(format!("{} & sleep 0.1", bridge_cmds.join(" & ")));
     }
 
     // Apply seccomp filter and execute command
@@ -157,12 +162,12 @@ fn build_inner_command(
                 "Seccomp not available - Unix socket creation will not be blocked"
             );
             let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
-            parts.push(format!("{} {} -c {}", env_vars, shell, quote(command)));
+            parts.push(format!("{} ; {} -c {}", env_vars, shell, quote(command)));
         }
     } else {
         // Unix sockets allowed, just run the command
         let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
-        parts.push(format!("{} {} -c {}", env_vars, shell, quote(command)));
+        parts.push(format!("{} ; {} -c {}", env_vars, shell, quote(command)));
     }
 
     Ok(parts.join(" ; "))
@@ -173,7 +178,7 @@ fn generate_proxy_env_string(http_port: u16, socks_port: u16) -> String {
     format!(
         "export http_proxy='http://localhost:{}' https_proxy='http://localhost:{}' \
          HTTP_PROXY='http://localhost:{}' HTTPS_PROXY='http://localhost:{}' \
-         ALL_PROXY='socks5://localhost:{}' all_proxy='socks5://localhost:{}' ;",
+         ALL_PROXY='socks5://localhost:{}' all_proxy='socks5://localhost:{}'",
         http_port, http_port, http_port, http_port, socks_port, socks_port
     )
 }
@@ -202,6 +207,65 @@ mod tests {
         let env = generate_proxy_env_string(3128, 1080);
         assert!(env.contains("http_proxy='http://localhost:3128'"));
         assert!(env.contains("ALL_PROXY='socks5://localhost:1080'"));
+        assert!(!env.ends_with(';'));
+    }
+
+    #[test]
+    fn test_build_inner_command_does_not_emit_double_separators() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allow_all_unix_sockets = Some(true);
+
+        let inner = build_inner_command(
+            "echo ok",
+            &config,
+            Some("/tmp/http.sock"),
+            Some("/tmp/socks.sock"),
+            3128,
+            1080,
+            "/bin/bash",
+        )
+        .expect("build_inner_command should succeed");
+
+        assert!(!inner.contains("& ;"), "unexpected '& ;' in: {inner}");
+        assert!(!inner.contains("; ;"), "unexpected '; ;' in: {inner}");
+    }
+
+    #[test]
+    fn test_build_inner_command_splits_export_and_shell_exec() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allow_all_unix_sockets = Some(true);
+
+        let inner = build_inner_command("ls", &config, None, None, 3128, 1080, "/bin/bash")
+            .expect("build_inner_command should succeed");
+
+        assert!(
+            inner.contains("all_proxy='socks5://localhost:1080' ; /bin/bash -c 'ls'"),
+            "inner command must separate export from shell execution: {inner}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_uses_provided_cwd_for_chdir() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allow_all_unix_sockets = Some(true);
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+        )
+        .expect("generate_bwrap_command should succeed");
+
+        assert!(
+            wrapped.contains("--chdir /tmp/simpleclaw-workspace"),
+            "wrapped command should use provided cwd: {wrapped}"
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ impl SocatBridge {
     /// This is used inside the sandbox to connect to the host proxies.
     pub fn tcp_to_unix_command(tcp_port: u16, socket_path: &str) -> String {
         format!(
-            "socat TCP-LISTEN:{},fork,reuseaddr UNIX-CONNECT:{}",
+            "socat TCP-LISTEN:{},fork,reuseaddr UNIX-CONNECT:{} </dev/null >/dev/null 2>&1",
             tcp_port, socket_path
         )
     }
@@ -131,7 +131,7 @@ mod tests {
         let cmd = SocatBridge::tcp_to_unix_command(3128, "/tmp/http.sock");
         assert_eq!(
             cmd,
-            "socat TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:/tmp/http.sock"
+            "socat TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:/tmp/http.sock </dev/null >/dev/null 2>&1"
         );
     }
 }
