@@ -23,13 +23,23 @@ use std::path::PathBuf;
 pub struct SandboxedCommand {
     program: String,
     args: Vec<String>,
-    // envs, cwd, etc.
+    envs: HashMap<String, String>,
+    cwd: Option<PathBuf>,
+    stdin: Option<std::process::Stdio>,
+    stdout: Option<std::process::Stdio>,
+    stderr: Option<std::process::Stdio>,
     config: SandboxRuntimeConfig,
 }
 
 impl SandboxedCommand {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self { ... }
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self { ... }
+    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, val: V) -> &mut Self { ... }
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self { ... }
+    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self { ... }
+    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self { ... }
+    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self { ... }
+    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self { ... }
     
     /// Apply a full SandboxRuntimeConfig
     pub fn config(&mut self, config: SandboxRuntimeConfig) -> &mut Self { ... }
@@ -43,7 +53,8 @@ impl SandboxedCommand {
     pub fn deny_domain<S: Into<String>>(&mut self, domain: S) -> &mut Self { ... }
     
     /// Executes the command and waits for completion, gathering output.
-    /// If sandbox violations occur, returns `Err(SandboxError::Violation(...))`.
+    /// If sandbox violations occur, returns `Err(SandboxError::ExecutionViolation(SandboxedExecutionError))`
+    /// which contains the full output (status, stdout, stderr) alongside the list of violations.
     pub async fn output(&mut self) -> Result<SandboxedOutput, SandboxError> { ... }
     
     /// Spawns the process and returns a handle to stream outputs/violations.
@@ -62,21 +73,26 @@ pub struct SandboxedOutput {
 
 ```rust
 pub struct SandboxedChild {
+    pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
     // internal handles for proxies, monitors, and the underlying process
 }
 
 impl SandboxedChild {
-    /// Wait for the process to exit. Returns an Err if any violations occurred during execution.
+    /// Wait for the process to exit. Returns `Ok(ExitStatus)` if successful.
+    /// Returns `Err(SandboxError::ExecutionViolation(...))` containing the `ExitStatus` and a `Vec<SandboxViolationEvent>` if any violations occurred.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, SandboxError> { ... }
     
-    // Future expansion: potentially a method to get a channel/stream of violations as they happen
+    /// Provides a stream of `SandboxViolationEvent`s as they happen in real-time.
+    /// On Linux, these are surfaced immediately from the seccomp listener.
+    pub fn violations(&mut self) -> tokio::sync::mpsc::Receiver<SandboxViolationEvent> { ... }
 }
 ```
 
 ### Proxy Lifecycle
 - Each `SandboxedCommand::spawn()` invocation will spin up its own HTTP and SOCKS5 proxies on ephemeral ports (port 0).
+- **Binding Failures:** If the OS cannot allocate an ephemeral port or binding fails (e.g., exhaustion of ports), `spawn()` will immediately return `Err(SandboxError::Network(...))`. No process will be spawned.
 - Proxies run as background tasks attached to the `SandboxedChild`.
 - Dropping `SandboxedChild` aborts the proxy tasks and cleans up sockets.
 - This eliminates shared mutable state across process executions.
@@ -85,7 +101,7 @@ impl SandboxedChild {
 
 #### macOS
 - `LogMonitor` is instantiated dynamically in `SandboxedCommand::spawn()`.
-- The Seatbelt profile will use a unique tag (e.g., a UUID) for the specific process so that concurrent `SandboxedChild` instances don't mix up violation logs.
+- The Seatbelt profile will use a unique tag or specific child PID filtering so that concurrent `SandboxedChild` instances don't mix up violation logs. (The current codebase uses a tag injection mechanism via `eventMessage CONTAINS '{}'`).
 
 #### Linux
 - `bwrap` remains the core isolation mechanism.
