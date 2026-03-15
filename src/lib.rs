@@ -3,40 +3,48 @@
 //! This library provides sandboxing capabilities for arbitrary processes without containerization:
 //! - macOS: Uses Seatbelt/sandbox-exec
 //! - Linux: Uses bubblewrap + seccomp
+//!
+//! # Example
+//!
+//! ```no_run
+//! use sandbox_runtime::{SandboxedCommand, SandboxError};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), SandboxError> {
+//!     let output = SandboxedCommand::new("echo")
+//!         .arg("hello")
+//!         .allow_read("/usr")
+//!         .allow_write("/tmp")
+//!         .allow_domain("example.com")
+//!         .output()
+//!         .await?;
+//!
+//!     println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+//!     Ok(())
+//! }
+//! ```
 
-pub mod cli;
+pub mod child;
+pub mod command;
 pub mod config;
 pub mod error;
-pub mod manager;
-pub mod proxy;
-pub mod sandbox;
-pub mod utils;
-pub mod violation;
+pub(crate) mod manager;
+pub(crate) mod proxy;
+pub(crate) mod sandbox;
+pub(crate) mod utils;
 
+pub use child::SandboxedChild;
+pub use command::{SandboxedCommand, SandboxedOutput};
 pub use config::{
     FilesystemConfig, MitmProxyConfig, NetworkConfig, RipgrepConfig, SandboxRuntimeConfig,
     SeccompConfig,
 };
-pub use error::{ConfigError, Result, SandboxError};
-pub use manager::{SandboxManager, WrappedCommand};
-pub use violation::{SandboxViolationEvent, SandboxViolationStore};
-
-#[cfg(target_os = "macos")]
-pub use sandbox::macos::LogMonitor;
-
-#[cfg(target_os = "linux")]
-pub use sandbox::linux::LinuxLogMonitor;
+pub use error::{ConfigError, Result, SandboxError, SandboxViolationEvent};
 
 /// Re-export commonly used items.
 pub mod prelude {
+    pub use crate::child::SandboxedChild;
+    pub use crate::command::{SandboxedCommand, SandboxedOutput};
     pub use crate::config::SandboxRuntimeConfig;
-    pub use crate::error::{Result, SandboxError};
-    pub use crate::manager::{SandboxManager, WrappedCommand};
-    pub use crate::violation::{SandboxViolationEvent, SandboxViolationStore};
-
-    #[cfg(target_os = "macos")]
-    pub use crate::sandbox::macos::LogMonitor;
-
-    #[cfg(target_os = "linux")]
-    pub use crate::sandbox::linux::LinuxLogMonitor;
+    pub use crate::error::{Result, SandboxError, SandboxViolationEvent};
 }

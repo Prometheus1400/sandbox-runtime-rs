@@ -6,5 +6,4 @@ pub mod profile;
 pub mod wrapper;
 
 pub use monitor::LogMonitor;
-pub use profile::{generate_log_tag, generate_profile};
-pub use wrapper::{cleanup_temp_profiles, generate_proxy_env, wrap_command};
+pub use wrapper::wrap_command;

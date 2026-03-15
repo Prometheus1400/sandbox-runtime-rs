@@ -107,6 +107,80 @@ pub fn generate_bwrap_command(
     Ok((wrapped, warnings))
 }
 
+#[cfg(target_os = "linux")]
+pub fn generate_bwrap_command_with_runner(
+    command: &str,
+    config: &SandboxRuntimeConfig,
+    cwd: &Path,
+    http_socket_path: Option<&str>,
+    socks_socket_path: Option<&str>,
+    http_proxy_port: u16,
+    socks_proxy_port: u16,
+    shell: Option<&str>,
+    runner_path: &Path,
+    notify_fd: i32,
+) -> Result<(String, Vec<String>), SandboxError> {
+    let shell = shell.unwrap_or("/bin/bash");
+    let (mounts, warnings) = generate_bind_mounts(
+        &config.filesystem,
+        cwd,
+        config.ripgrep.as_ref(),
+        config.mandatory_deny_search_depth,
+    )?;
+
+    let mut bwrap_args = vec!["bwrap".to_string(), "--unshare-net".to_string()];
+    bwrap_args.push("--ro-bind".to_string());
+    bwrap_args.push("/".to_string());
+    bwrap_args.push("/".to_string());
+    bwrap_args.push("--dev".to_string());
+    bwrap_args.push("/dev".to_string());
+    bwrap_args.push("--proc".to_string());
+    bwrap_args.push("/proc".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/tmp".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/run".to_string());
+
+    for mount in &mounts {
+        if !mount.readonly {
+            bwrap_args.extend(mount.to_bwrap_args());
+        }
+    }
+    for mount in &mounts {
+        if mount.readonly {
+            bwrap_args.extend(mount.to_bwrap_args());
+        }
+    }
+
+    bwrap_args.push("--chdir".to_string());
+    bwrap_args.push(cwd.display().to_string());
+
+    let inner_command = build_inner_command_with_runner(
+        command,
+        config,
+        http_socket_path,
+        socks_socket_path,
+        http_proxy_port,
+        socks_proxy_port,
+        shell,
+        runner_path,
+        notify_fd,
+    )?;
+
+    bwrap_args.push("--".to_string());
+    bwrap_args.push(shell.to_string());
+    bwrap_args.push("-c".to_string());
+    bwrap_args.push(inner_command);
+
+    let wrapped = bwrap_args
+        .iter()
+        .map(|s| quote(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok((wrapped, warnings))
+}
+
 /// Build the inner command to run inside bubblewrap.
 /// This sets up socat bridges and applies seccomp before running the user command.
 fn build_inner_command(
@@ -158,9 +232,7 @@ fn build_inner_command(
             ));
         } else {
             // Seccomp not available, just run the command with warning
-            tracing::warn!(
-                "Seccomp not available - Unix socket creation will not be blocked"
-            );
+            tracing::warn!("Seccomp not available - Unix socket creation will not be blocked");
             let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
             parts.push(format!("{} ; {} -c {}", env_vars, shell, quote(command)));
         }
@@ -181,6 +253,51 @@ fn generate_proxy_env_string(http_port: u16, socks_port: u16) -> String {
          ALL_PROXY='socks5://localhost:{}' all_proxy='socks5://localhost:{}'",
         http_port, http_port, http_port, http_port, socks_port, socks_port
     )
+}
+
+#[cfg(target_os = "linux")]
+fn build_inner_command_with_runner(
+    command: &str,
+    config: &SandboxRuntimeConfig,
+    http_socket_path: Option<&str>,
+    socks_socket_path: Option<&str>,
+    http_proxy_port: u16,
+    socks_proxy_port: u16,
+    shell: &str,
+    runner_path: &Path,
+    notify_fd: i32,
+) -> Result<String, SandboxError> {
+    let mut parts = Vec::new();
+    let mut bridge_cmds = Vec::new();
+
+    if let Some(http_sock) = http_socket_path {
+        bridge_cmds.push(SocatBridge::tcp_to_unix_command(http_proxy_port, http_sock));
+    }
+    if let Some(socks_sock) = socks_socket_path {
+        bridge_cmds.push(SocatBridge::tcp_to_unix_command(socks_proxy_port, socks_sock));
+    }
+    if !bridge_cmds.is_empty() {
+        parts.push(format!("{} & sleep 0.1", bridge_cmds.join(" & ")));
+    }
+
+    let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
+    parts.push(env_vars);
+
+    if config.network.allow_all_unix_sockets.unwrap_or(false) {
+        parts.push(format!("exec {} -c {}", quote(shell), quote(command)));
+    } else {
+        let bpf_path = get_bpf_path(config.seccomp.as_ref())?;
+        parts.push(format!(
+            "exec {} {} {} {} -c {}",
+            quote(&runner_path.display().to_string()),
+            notify_fd,
+            quote(&bpf_path.display().to_string()),
+            quote(shell),
+            quote(command)
+        ));
+    }
+
+    Ok(parts.join(" ; "))
 }
 
 /// Generate proxy environment variables.
