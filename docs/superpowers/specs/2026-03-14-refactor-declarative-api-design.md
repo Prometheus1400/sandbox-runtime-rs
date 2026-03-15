@@ -30,7 +30,17 @@ pub struct SandboxedCommand {
 impl SandboxedCommand {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self { ... }
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self { ... }
+    
+    /// Apply a full SandboxRuntimeConfig
     pub fn config(&mut self, config: SandboxRuntimeConfig) -> &mut Self { ... }
+    
+    /// Builder methods for fine-grained filesystem permissions
+    pub fn allow_read<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self { ... }
+    pub fn allow_write<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self { ... }
+    
+    /// Builder methods for fine-grained network permissions
+    pub fn allow_domain<S: Into<String>>(&mut self, domain: S) -> &mut Self { ... }
+    pub fn deny_domain<S: Into<String>>(&mut self, domain: S) -> &mut Self { ... }
     
     /// Executes the command and waits for completion, gathering output.
     /// If sandbox violations occur, returns `Err(SandboxError::Violation(...))`.
