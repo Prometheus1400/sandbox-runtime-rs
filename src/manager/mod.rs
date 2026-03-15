@@ -303,8 +303,9 @@ impl SandboxManager {
     /// Wrap a command with sandbox restrictions.
     ///
     /// Returns a [`WrappedCommand`] containing the sandboxed command string and,
-    /// on macOS, the log tag used for violation monitoring. On macOS, violation
-    /// monitoring is automatically started.
+    /// on macOS, the log tag used for violation monitoring. Does **not** start
+    /// monitoring — use [`execute_command`] for the full lifecycle, or call
+    /// [`start_monitoring`] manually after spawning the process.
     pub async fn wrap_with_sandbox(
         &self,
         command: &str,
@@ -343,13 +344,6 @@ impl SandboxManager {
                 shell,
                 true, // enable log monitor
             )?;
-
-            // Automatically start violation monitoring if we have a log tag
-            if log_tag.is_some() {
-                if let Err(e) = self.start_monitoring(log_tag.as_deref(), None, command).await {
-                    tracing::warn!("Failed to start violation monitoring: {}", e);
-                }
-            }
 
             Ok(WrappedCommand {
                 command: wrapped,
@@ -391,6 +385,40 @@ impl SandboxManager {
                 "Platform not supported".to_string(),
             ))
         }
+    }
+
+    /// Execute a command inside the sandbox with automatic violation monitoring.
+    ///
+    /// This is the unified, cross-platform entry point. It wraps the command,
+    /// spawns it, starts violation monitoring, waits for completion, and returns
+    /// the exit status. Violations are collected in the violation store accessible
+    /// via [`get_violation_store`].
+    pub async fn execute_command(
+        &self,
+        command: &str,
+        shell: Option<&str>,
+        custom_config: Option<SandboxRuntimeConfig>,
+        cwd: &Path,
+    ) -> Result<std::process::ExitStatus, SandboxError> {
+        let wrapped = self.wrap_with_sandbox(command, shell, custom_config, cwd).await?;
+
+        tracing::debug!("Executing sandboxed command: {}", wrapped.command);
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped.command)
+            .spawn()?;
+
+        // Start violation monitoring — platform-appropriate arguments
+        let monitor_result = self
+            .start_monitoring(wrapped.log_tag.as_deref(), child.id(), command)
+            .await;
+        if let Err(e) = monitor_result {
+            tracing::warn!("Failed to start violation monitoring: {}", e);
+        }
+
+        let status = child.wait().await?;
+        Ok(status)
     }
 
     /// Annotate stderr with sandbox failure information.
