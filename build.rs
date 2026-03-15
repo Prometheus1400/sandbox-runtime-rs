@@ -25,4 +25,19 @@ fn build_linux_seccomp_runner() {
         .expect("failed to invoke C compiler for seccomp runner");
 
     assert!(status.success(), "failed to compile seccomp runner");
+
+    // Copy BPF filter to OUT_DIR for embedding
+    let arch_dir = if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        panic!("unsupported architecture for seccomp BPF filter")
+    };
+
+    let bpf_src = format!("vendor/seccomp/{}/unix-block.bpf", arch_dir);
+    let bpf_dst = format!("{out_dir}/unix-block.bpf");
+    std::fs::copy(&bpf_src, &bpf_dst)
+        .unwrap_or_else(|e| panic!("failed to copy BPF filter from {}: {}", bpf_src, e));
+    println!("cargo:rerun-if-changed={bpf_src}");
 }

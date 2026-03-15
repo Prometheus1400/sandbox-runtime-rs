@@ -14,6 +14,9 @@ use crate::utils::get_arch;
 #[cfg(target_os = "linux")]
 const SECCOMP_RUNNER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp-runner"));
 
+#[cfg(target_os = "linux")]
+const SECCOMP_BPF_FILTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unix-block.bpf"));
+
 /// Cache for BPF path lookups (key: explicit path or empty string, value: resolved path or None)
 static BPF_PATH_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -94,6 +97,21 @@ fn find_bpf_path(explicit_path: Option<&str>) -> Option<PathBuf> {
                 arch
             );
             return Some(path);
+        }
+    }
+
+    // Fallback: extract embedded BPF filter
+    #[cfg(target_os = "linux")]
+    {
+        tracing::debug!(
+            "[SeccompFilter] Pre-generated BPF filter not found on disk, extracting embedded filter ({})",
+            arch
+        );
+        match extract_bpf_filter() {
+            Ok(path) => return Some(path),
+            Err(e) => {
+                tracing::warn!("[SeccompFilter] Failed to extract embedded BPF filter: {}", e);
+            }
         }
     }
 
@@ -241,6 +259,24 @@ pub fn extract_seccomp_runner() -> Result<PathBuf, SandboxError> {
 
     std::fs::write(&path, SECCOMP_RUNNER_BIN)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+/// Extract the embedded BPF filter to a temporary file.
+/// Used as a fallback when the filter can't be found on disk.
+#[cfg(target_os = "linux")]
+pub fn extract_bpf_filter() -> Result<PathBuf, SandboxError> {
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let suffix: u32 = rng.gen();
+    let path = PathBuf::from(format!(
+        "/var/tmp/srt-bpf-{}-{:08x}",
+        std::process::id(),
+        suffix
+    ));
+
+    std::fs::write(&path, SECCOMP_BPF_FILTER)?;
     Ok(path)
 }
 
