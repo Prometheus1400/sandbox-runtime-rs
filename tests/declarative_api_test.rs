@@ -212,6 +212,45 @@ async fn test_proxy_denied_domain_reports_violation() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore]
+async fn test_sandboxed_trash_violation() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let canonical_dir = dir.path().canonicalize().expect("failed to canonicalize tempdir");
+    let file_path = canonical_dir.join("testfile.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).expect("failed to create test file");
+        f.write_all(b"delete me").expect("failed to write");
+    }
+
+    let result = SandboxedCommand::new("/usr/bin/trash")
+        .arg(file_path.to_str().unwrap())
+        .allow_read("/")
+        .output()
+        .await;
+
+    match result {
+        Err(SandboxError::ExecutionViolation(err)) => {
+            assert!(
+                !err.violations.is_empty(),
+                "expected non-empty violations for sandboxed trash"
+            );
+        }
+        Ok(output) => {
+            assert!(
+                !output.status.success(),
+                "expected trash to fail without write permissions, got success"
+            );
+        }
+        Err(e) => {
+            panic!("unexpected error: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
 async fn test_successful_process_no_false_violations() {
     let output = SandboxedCommand::new("echo")
         .arg("hello")

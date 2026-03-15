@@ -9,7 +9,8 @@ use crate::error::{SandboxError, SandboxViolationEvent, SandboxedExecutionError}
 use crate::manager::network::initialize_proxies;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::{
-    generate_bwrap_command, generate_socket_path, LinuxLogMonitor, SocatBridge,
+    extract_seccomp_runner, generate_bwrap_command_with_runner, generate_socket_path,
+    LinuxLogMonitor, SocatBridge,
 };
 #[cfg(target_os = "macos")]
 use crate::sandbox::macos::{wrap_command as wrap_macos_command, LogMonitor};
@@ -339,6 +340,8 @@ impl SandboxedCommand {
         violations_tx: mpsc::Sender<SandboxViolationEvent>,
         violations_rx: mpsc::Receiver<SandboxViolationEvent>,
     ) -> Result<SandboxedChild, SandboxError> {
+        use std::os::unix::io::AsRawFd;
+
         let http_socket_path = generate_socket_path("srt-http");
         let socks_socket_path = generate_socket_path("srt-socks");
         let http_bridge =
@@ -346,7 +349,22 @@ impl SandboxedCommand {
         let socks_bridge =
             SocatBridge::unix_to_tcp(socks_socket_path.clone(), "127.0.0.1", socks_port).await?;
 
-        let (wrapped, warnings) = generate_bwrap_command(
+        // Create Unix socketpair for seccomp notification fd passing
+        let (parent_sock, child_sock) =
+            std::os::unix::net::UnixStream::pair().map_err(SandboxError::Io)?;
+
+        // Set receive timeout on parent socket so we don't block forever
+        parent_sock
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(SandboxError::Io)?;
+
+        // Extract the embedded seccomp-runner binary
+        let runner_path = extract_seccomp_runner()?;
+
+        let child_fd = child_sock.as_raw_fd();
+
+        // Generate bwrap command using the runner variant
+        let (wrapped, warnings) = generate_bwrap_command_with_runner(
             &command,
             &self.config,
             &cwd,
@@ -355,6 +373,8 @@ impl SandboxedCommand {
             http_port,
             socks_port,
             None,
+            &runner_path,
+            child_fd,
         )?;
         for warning in warnings {
             tracing::warn!("{warning}");
@@ -364,9 +384,32 @@ impl SandboxedCommand {
         inner.arg("-c").arg(wrapped);
         self.apply_outer_builder(&mut inner, &cwd);
 
+        // Clear close-on-exec on child_fd so it survives into the child process
+        unsafe {
+            inner.pre_exec(move || {
+                let flags = libc::fcntl(child_fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut child = inner.spawn()?;
+        drop(child_sock); // Close child end in parent
+
+        // Receive the seccomp listener fd from the runner via SCM_RIGHTS
+        let listener_fd = recv_fd(&parent_sock)?;
+        drop(parent_sock);
+
+        // Clean up runner binary — the child has already exec'd it
+        let _ = std::fs::remove_file(&runner_path);
+
         let monitor =
-            LinuxLogMonitor::start(child.id(), Some(command.clone()), violations_tx).await?;
+            LinuxLogMonitor::start(listener_fd, Some(command.clone()), violations_tx).await?;
 
         Ok(SandboxedChild {
             stdin: child.stdin.take(),
@@ -377,9 +420,44 @@ impl SandboxedCommand {
             http_proxy: Some(http_proxy),
             socks_proxy: Some(socks_proxy),
             bridges: vec![http_bridge, socks_bridge],
-            monitor,
+            monitor: Some(monitor),
         })
     }
+}
+
+/// Receive a file descriptor over a Unix socket via SCM_RIGHTS.
+/// Counterpart to the `send_fd()` in runner.c.
+#[cfg(target_os = "linux")]
+fn recv_fd(
+    sock: &std::os::unix::net::UnixStream,
+) -> Result<std::os::fd::OwnedFd, SandboxError> {
+    use nix::cmsg_space;
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut buf = [0u8; 1];
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg_buf = cmsg_space!(i32);
+
+    let msg = recvmsg::<()>(
+        sock.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        MsgFlags::empty(),
+    )
+    .map_err(|e| SandboxError::Seccomp(format!("recvmsg for listener fd: {e}")))?;
+
+    for cmsg in msg.cmsgs() {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+            if let Some(&fd) = fds.first() {
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+
+    Err(SandboxError::Seccomp(
+        "no listener fd received from seccomp runner".into(),
+    ))
 }
 
 fn looks_like_sandbox_denial(stderr: &str) -> bool {
@@ -391,6 +469,12 @@ fn looks_like_sandbox_denial(stderr: &str) -> bool {
         return true;
     }
     if lower.contains("permission denied") {
+        return true;
+    }
+    if lower.contains("don't have permission to access") {
+        return true;
+    }
+    if lower.contains("afpaccessdenied") {
         return true;
     }
     false

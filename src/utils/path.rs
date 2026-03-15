@@ -33,6 +33,41 @@ pub fn contains_glob_chars(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
 }
 
+/// Strip trailing glob components from a path.
+///
+/// For example, `/foo/bar/**` becomes `/foo/bar` and `/foo/*/baz` becomes `/foo`.
+/// Used to extract the base directory from a glob pattern for bind-mounting.
+#[cfg(target_os = "linux")]
+pub fn remove_trailing_glob_suffix(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut base_parts = Vec::new();
+    for part in &parts {
+        if contains_glob_chars(part) {
+            break;
+        }
+        base_parts.push(*part);
+    }
+    let result = base_parts.join("/");
+    if result.is_empty() {
+        "/".to_string()
+    } else {
+        result
+    }
+}
+
+/// Check if a resolved (canonicalized) path escapes the boundary of the original path's parent.
+///
+/// Returns `true` if the symlink target is outside the parent directory of `path`.
+#[cfg(target_os = "linux")]
+pub fn is_symlink_outside_boundary(path: &std::path::Path, resolved: &std::path::Path) -> bool {
+    if let Some(parent) = path.parent() {
+        !resolved.starts_with(parent)
+    } else {
+        // Root path — resolved can't escape
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
