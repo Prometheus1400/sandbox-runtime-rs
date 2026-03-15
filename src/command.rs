@@ -5,7 +5,7 @@ use std::process::Stdio;
 
 use crate::child::SandboxedChild;
 use crate::config::SandboxRuntimeConfig;
-use crate::error::{SandboxError, SandboxedExecutionError};
+use crate::error::{SandboxError, SandboxViolationEvent, SandboxedExecutionError};
 use crate::manager::network::initialize_proxies;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::{
@@ -15,6 +15,7 @@ use crate::sandbox::linux::{
 use crate::sandbox::macos::{wrap_command as wrap_macos_command, LogMonitor};
 use crate::utils::{current_platform, join_args, Platform};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 pub struct SandboxedCommand {
     program: String,
@@ -27,10 +28,12 @@ pub struct SandboxedCommand {
     config: SandboxRuntimeConfig,
 }
 
+#[derive(Debug)]
 pub struct SandboxedOutput {
     pub status: std::process::ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub violations: Vec<SandboxViolationEvent>,
 }
 
 impl SandboxedCommand {
@@ -129,7 +132,9 @@ impl SandboxedCommand {
             .ok_or_else(|| SandboxError::UnsupportedPlatform("Unsupported platform".to_string()))?;
         crate::sandbox::check_dependencies(platform)?;
 
-        let (http_proxy, socks_proxy) = initialize_proxies(&self.config.network).await?;
+        let (violations_tx, violations_rx) = mpsc::channel(100);
+        let (http_proxy, socks_proxy) =
+            initialize_proxies(&self.config.network, violations_tx.clone()).await?;
         let http_port = http_proxy.port();
         let socks_port = socks_proxy.port();
         let cwd = self.resolve_cwd()?;
@@ -139,12 +144,30 @@ impl SandboxedCommand {
             Platform::MacOS => {
                 #[cfg(target_os = "macos")]
                 {
-                    self.spawn_macos(command, cwd, http_proxy, socks_proxy, http_port, socks_port)
-                        .await
+                    self.spawn_macos(
+                        command,
+                        cwd,
+                        http_proxy,
+                        socks_proxy,
+                        http_port,
+                        socks_port,
+                        violations_tx,
+                        violations_rx,
+                    )
+                    .await
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (command, cwd, http_proxy, socks_proxy, http_port, socks_port);
+                    let _ = (
+                        command,
+                        cwd,
+                        http_proxy,
+                        socks_proxy,
+                        http_port,
+                        socks_port,
+                        violations_tx,
+                        violations_rx,
+                    );
                     Err(SandboxError::UnsupportedPlatform(
                         "macOS sandbox code not compiled on this platform".to_string(),
                     ))
@@ -153,12 +176,30 @@ impl SandboxedCommand {
             Platform::Linux => {
                 #[cfg(target_os = "linux")]
                 {
-                    self.spawn_linux(command, cwd, http_proxy, socks_proxy, http_port, socks_port)
-                        .await
+                    self.spawn_linux(
+                        command,
+                        cwd,
+                        http_proxy,
+                        socks_proxy,
+                        http_port,
+                        socks_port,
+                        violations_tx,
+                        violations_rx,
+                    )
+                    .await
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = (command, cwd, http_proxy, socks_proxy, http_port, socks_port);
+                    let _ = (
+                        command,
+                        cwd,
+                        http_proxy,
+                        socks_proxy,
+                        http_port,
+                        socks_port,
+                        violations_tx,
+                        violations_rx,
+                    );
                     Err(SandboxError::UnsupportedPlatform(
                         "Linux sandbox code not compiled on this platform".to_string(),
                     ))
@@ -174,21 +215,40 @@ impl SandboxedCommand {
 
         let mut child = self.spawn().await?;
         let output = child.wait_with_output().await?;
-        let violations = child.take_pending_violations();
-        if violations.is_empty() {
-            Ok(SandboxedOutput {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        } else {
-            Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
+        let violations = child.drain_violations().await;
+
+        if !violations.is_empty() && !output.status.success() {
+            return Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
                 status: Some(output.status),
                 stdout: output.stdout,
                 stderr: output.stderr,
                 violations,
-            }))
+            }));
         }
+
+        // Heuristic fallback: infer sandbox denial from stderr when no violations were captured
+        if violations.is_empty() && !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            if looks_like_sandbox_denial(&stderr_str) {
+                let synthetic = SandboxViolationEvent::new(format!(
+                    "inferred: process exited with {} and stderr suggests sandbox denial",
+                    output.status
+                ));
+                return Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
+                    status: Some(output.status),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    violations: vec![synthetic],
+                }));
+            }
+        }
+
+        Ok(SandboxedOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            violations,
+        })
     }
 
     fn render_command(&self) -> String {
@@ -220,6 +280,7 @@ impl SandboxedCommand {
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_macos(
         &mut self,
         command: String,
@@ -228,6 +289,8 @@ impl SandboxedCommand {
         socks_proxy: crate::proxy::Socks5Proxy,
         http_port: u16,
         socks_port: u16,
+        violations_tx: mpsc::Sender<SandboxViolationEvent>,
+        violations_rx: mpsc::Receiver<SandboxViolationEvent>,
     ) -> Result<SandboxedChild, SandboxError> {
         let (wrapped, log_tag) = wrap_macos_command(
             &command,
@@ -243,15 +306,13 @@ impl SandboxedCommand {
         self.apply_outer_builder(&mut inner, &cwd);
 
         let mut child = inner.spawn()?;
-        let child_id = child.id();
-        let (monitor, violations_rx) = if let Some(tag) = log_tag {
-            let (monitor, rx) = LogMonitor::start(tag, Some(command.clone())).await?;
-            (Some(monitor), rx)
+        let monitor = if let Some(tag) = log_tag {
+            Some(LogMonitor::start(tag, Some(command.clone()), violations_tx).await?)
         } else {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
-            (None, rx)
+            // Drop the sender so the channel can close when proxies are done
+            drop(violations_tx);
+            None
         };
-        let _ = child_id;
 
         Ok(SandboxedChild {
             stdin: child.stdin.take(),
@@ -266,6 +327,7 @@ impl SandboxedCommand {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_linux(
         &mut self,
         command: String,
@@ -274,6 +336,8 @@ impl SandboxedCommand {
         socks_proxy: crate::proxy::Socks5Proxy,
         http_port: u16,
         socks_port: u16,
+        violations_tx: mpsc::Sender<SandboxViolationEvent>,
+        violations_rx: mpsc::Receiver<SandboxViolationEvent>,
     ) -> Result<SandboxedChild, SandboxError> {
         let http_socket_path = generate_socket_path("srt-http");
         let socks_socket_path = generate_socket_path("srt-socks");
@@ -301,8 +365,8 @@ impl SandboxedCommand {
         self.apply_outer_builder(&mut inner, &cwd);
 
         let mut child = inner.spawn()?;
-        let (monitor, violations_rx) =
-            LinuxLogMonitor::start(child.id(), Some(command.clone())).await?;
+        let monitor =
+            LinuxLogMonitor::start(child.id(), Some(command.clone()), violations_tx).await?;
 
         Ok(SandboxedChild {
             stdin: child.stdin.take(),
@@ -316,4 +380,18 @@ impl SandboxedCommand {
             monitor,
         })
     }
+}
+
+fn looks_like_sandbox_denial(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    if lower.contains("operation not permitted") {
+        return true;
+    }
+    if lower.contains("sandbox") && lower.contains("deny") {
+        return true;
+    }
+    if lower.contains("permission denied") {
+        return true;
+    }
+    false
 }

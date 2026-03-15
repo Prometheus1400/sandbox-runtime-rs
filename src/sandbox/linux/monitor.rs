@@ -59,27 +59,24 @@ impl LinuxLogMonitor {
     pub async fn start(
         listener_fd: OwnedFd,
         command: Option<String>,
-    ) -> Result<(Self, mpsc::Receiver<SandboxViolationEvent>), SandboxError> {
+        tx: mpsc::Sender<SandboxViolationEvent>,
+    ) -> Result<Self, SandboxError> {
         let raw_fd = listener_fd.as_raw_fd();
-        let (tx, rx) = mpsc::channel(100);
         let task = tokio::task::spawn_blocking(move || monitor_loop(raw_fd, command, tx));
 
-        Ok((
-            Self {
-                listener_fd: Some(listener_fd),
-                task: Some(task),
-            },
-            rx,
-        ))
+        Ok(Self {
+            listener_fd: Some(listener_fd),
+            task: Some(task),
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     pub async fn start(
         _listener_fd: (),
         _command: Option<String>,
-    ) -> Result<(Self, mpsc::Receiver<SandboxViolationEvent>), SandboxError> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok((Self {}, rx))
+        _tx: mpsc::Sender<SandboxViolationEvent>,
+    ) -> Result<Self, SandboxError> {
+        Ok(Self {})
     }
 
     pub async fn stop(&mut self) {

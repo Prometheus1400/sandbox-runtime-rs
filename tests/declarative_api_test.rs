@@ -92,22 +92,19 @@ async fn test_sandboxed_write_violation() {
         .output()
         .await;
 
+    // With the stderr heuristic fallback, this should reliably return ExecutionViolation
     match result {
         Err(SandboxError::ExecutionViolation(err)) => {
             assert!(!err.violations.is_empty(), "expected at least one violation");
         }
-        Ok(output) => {
-            // The sandbox may deny via exit code rather than violation event
-            assert!(
-                !output.status.success(),
-                "write to non-allowed path should fail"
-            );
-        }
         Err(e) => {
-            // Other errors (like command failure) are also acceptable
-            assert!(
-                !file_path.exists(),
-                "file should not exist after sandbox denial, got error: {e}"
+            panic!("expected ExecutionViolation, got: {e}");
+        }
+        Ok(output) => {
+            panic!(
+                "expected ExecutionViolation, got Ok with status {:?}, stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }
@@ -134,4 +131,101 @@ async fn test_network_denied_domain() {
 
     // Test passes as long as it doesn't panic
     assert!(result.is_ok() || result.is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn test_sandboxed_write_violation_reports_details() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let canonical_dir = dir.path().canonicalize().expect("canonicalize tempdir");
+    let file_path = canonical_dir.join("forbidden2.txt");
+
+    let result = SandboxedCommand::new("sh")
+        .arg("-c")
+        .arg(format!("echo bad > {}", file_path.display()))
+        .allow_read("/")
+        .output()
+        .await;
+
+    match result {
+        Err(SandboxError::ExecutionViolation(err)) => {
+            assert!(!err.violations.is_empty(), "expected at least one violation");
+            let first = &err.violations[0];
+            assert!(!first.line.is_empty(), "violation line should be non-empty");
+        }
+        other => {
+            panic!("expected ExecutionViolation, got: {other:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn test_proxy_denied_domain_reports_violation() {
+    // Curl through the proxy with a denied domain. The proxy should generate
+    // a SandboxViolationEvent and output() should return ExecutionViolation.
+    let result = SandboxedCommand::new("curl")
+        .arg("-s")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("--max-time")
+        .arg("5")
+        .arg("http://example.com")
+        .allow_read("/")
+        .deny_domain("example.com")
+        .output()
+        .await;
+
+    match result {
+        Err(SandboxError::ExecutionViolation(err)) => {
+            let proxy_violations: Vec<_> = err
+                .violations
+                .iter()
+                .filter(|v| v.line.contains("proxy:"))
+                .collect();
+            assert!(
+                !proxy_violations.is_empty(),
+                "expected proxy-generated violation, got: {:?}",
+                err.violations
+            );
+        }
+        Ok(output) => {
+            // If the process didn't route through the proxy (no proxy env injected),
+            // we may get Ok. Check that violations are empty and process succeeded,
+            // or that we got non-fatal violations.
+            // This is acceptable since proxy env injection is not yet automatic.
+            eprintln!(
+                "proxy test: Ok with status {:?}, violations: {:?}",
+                output.status,
+                output.violations.len()
+            );
+        }
+        Err(e) => {
+            // Other errors are acceptable if proxy env vars aren't injected
+            eprintln!("proxy test: got error (may be expected): {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore]
+async fn test_successful_process_no_false_violations() {
+    let output = SandboxedCommand::new("echo")
+        .arg("hello")
+        .allow_read("/")
+        .output()
+        .await
+        .expect("echo should succeed");
+
+    assert!(output.status.success());
+    assert!(
+        output.violations.is_empty(),
+        "expected no violations for simple echo, got: {:?}",
+        output.violations
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "hello");
 }

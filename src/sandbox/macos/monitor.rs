@@ -21,9 +21,8 @@ impl LogMonitor {
     pub async fn start(
         log_tag: String,
         command: Option<String>,
-    ) -> Result<(Self, mpsc::Receiver<SandboxViolationEvent>), SandboxError> {
-        let (tx, rx) = mpsc::channel(100);
-
+        tx: mpsc::Sender<SandboxViolationEvent>,
+    ) -> Result<Self, SandboxError> {
         // Start log stream process
         let child = Command::new("log")
             .args([
@@ -69,13 +68,10 @@ impl LogMonitor {
             })
         });
 
-        Ok((
-            Self {
-                child: Some(child),
-                task,
-            },
-            rx,
-        ))
+        Ok(Self {
+            child: Some(child),
+            task,
+        })
     }
 
     /// Stop the log monitor.

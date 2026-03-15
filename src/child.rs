@@ -41,7 +41,7 @@ impl SandboxedChild {
             .await?;
 
         self.shutdown_runtime().await;
-        let violations = self.take_pending_violations();
+        let violations = self.drain_violations().await;
         if violations.is_empty() {
             Ok(status)
         } else {
@@ -74,11 +74,27 @@ impl SandboxedChild {
         Ok(output)
     }
 
-    pub(crate) fn take_pending_violations(&mut self) -> Vec<SandboxViolationEvent> {
+    pub(crate) async fn drain_violations(&mut self) -> Vec<SandboxViolationEvent> {
+        // Drop proxy structs to signal their accept loops to stop and release senders.
+        // The monitor is already stopped in shutdown_runtime, so its sender is dropped.
+        // Per-connection handler tasks may briefly hold sender clones until connections close.
+        self.http_proxy.take();
+        self.socks_proxy.take();
+
         let mut violations = Vec::new();
-        if let Some(rx) = self.violations_rx.as_mut() {
-            while let Ok(event) = rx.try_recv() {
-                violations.push(event);
+        if let Some(mut rx) = self.violations_rx.take() {
+            // Drain until channel closed or timeout (safety net for lingering handler tasks)
+            loop {
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(100),
+                    rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(event)) => violations.push(event),
+                    Ok(None) => break, // channel closed, all senders dropped
+                    Err(_) => break,   // timeout, no more events coming
+                }
             }
         }
         violations
@@ -95,14 +111,8 @@ impl SandboxedChild {
             bridge.stop().await;
         }
 
-        if let Some(proxy) = self.http_proxy.as_mut() {
-            proxy.stop();
-        }
-        if let Some(proxy) = self.socks_proxy.as_mut() {
-            proxy.stop();
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Don't stop proxies here — drain_violations will drop them to close the channel.
+        // If drain_violations is not called (e.g. wait() path), we still stop them.
     }
 }
 

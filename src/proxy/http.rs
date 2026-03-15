@@ -11,9 +11,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::error::SandboxError;
+use crate::error::{SandboxError, SandboxViolationEvent};
 use crate::proxy::filter::{DomainFilter, FilterDecision};
 
 /// HTTP proxy server.
@@ -23,6 +23,7 @@ pub struct HttpProxy {
     filter: Arc<DomainFilter>,
     mitm_socket_path: Option<String>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 }
 
 impl HttpProxy {
@@ -30,6 +31,7 @@ impl HttpProxy {
     pub async fn new(
         filter: DomainFilter,
         mitm_socket_path: Option<String>,
+        violations_tx: mpsc::Sender<SandboxViolationEvent>,
     ) -> Result<Self, SandboxError> {
         // Bind to localhost on any available port
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -43,6 +45,7 @@ impl HttpProxy {
             filter: Arc::new(filter),
             mitm_socket_path,
             shutdown_tx: None,
+            violations_tx,
         })
     }
 
@@ -60,6 +63,7 @@ impl HttpProxy {
 
         let filter = self.filter.clone();
         let mitm_socket_path = self.mitm_socket_path.clone();
+        let violations_tx = self.violations_tx.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -71,8 +75,9 @@ impl HttpProxy {
                             Ok((stream, addr)) => {
                                 let filter = filter.clone();
                                 let mitm_socket = mitm_socket_path.clone();
+                                let vtx = violations_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_connection(stream, addr, filter, mitm_socket).await {
+                                    if let Err(e) = handle_connection(stream, addr, filter, mitm_socket, vtx).await {
                                         tracing::debug!("Connection error from {}: {}", addr, e);
                                     }
                                 });
@@ -107,6 +112,7 @@ async fn handle_connection(
     _addr: SocketAddr,
     filter: Arc<DomainFilter>,
     mitm_socket_path: Option<String>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
 
@@ -121,7 +127,8 @@ async fn handle_connection(
             service_fn(move |req| {
                 let filter = filter_clone.clone();
                 let mitm_socket = mitm_socket_clone.clone();
-                async move { handle_request(req, filter, mitm_socket).await }
+                let vtx = violations_tx.clone();
+                async move { handle_request(req, filter, mitm_socket, vtx).await }
             }),
         )
         .with_upgrades()
@@ -135,11 +142,12 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     filter: Arc<DomainFilter>,
     mitm_socket_path: Option<String>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, filter, mitm_socket_path).await
+        handle_connect(req, filter, mitm_socket_path, violations_tx).await
     } else {
-        handle_http(req, filter, mitm_socket_path).await
+        handle_http(req, filter, mitm_socket_path, violations_tx).await
     }
 }
 
@@ -148,6 +156,7 @@ async fn handle_connect(
     req: Request<hyper::body::Incoming>,
     filter: Arc<DomainFilter>,
     mitm_socket_path: Option<String>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let host = req.uri().host().unwrap_or_default().to_string();
     let port = req.uri().port_u16().unwrap_or(443);
@@ -160,6 +169,12 @@ async fn handle_connect(
     match decision {
         FilterDecision::Deny => {
             tracing::debug!("Denied CONNECT to {}:{}", host, port);
+            let _ = violations_tx
+                .send(SandboxViolationEvent::new(format!(
+                    "proxy: denied connection to {}:{}",
+                    host, port
+                )))
+                .await;
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(empty_body())
@@ -280,6 +295,7 @@ async fn handle_http(
     req: Request<hyper::body::Incoming>,
     filter: Arc<DomainFilter>,
     mitm_socket_path: Option<String>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let host = req
         .uri()
@@ -302,6 +318,12 @@ async fn handle_http(
 
     if matches!(decision, FilterDecision::Deny) {
         tracing::debug!("Denied HTTP to {}:{}", host, port);
+        let _ = violations_tx
+            .send(SandboxViolationEvent::new(format!(
+                "proxy: denied HTTP request to {}:{}",
+                host, port
+            )))
+            .await;
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(full_body("Access denied by sandbox policy"))
