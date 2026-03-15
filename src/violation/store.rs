@@ -169,6 +169,23 @@ mod tests {
     }
 
     #[test]
+    fn test_listener_receives_violation() {
+        let store = SandboxViolationStore::new();
+        let received = Arc::new(RwLock::new(Vec::new()));
+        let received_clone = received.clone();
+
+        store.subscribe(Box::new(move |event| {
+            received_clone.write().push(event.line.clone());
+        }));
+
+        store.add_violation(SandboxViolationEvent::new("test violation".to_string()));
+
+        let lines = received.read();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "test violation");
+    }
+
+    #[test]
     fn test_clear() {
         let store = SandboxViolationStore::new();
 

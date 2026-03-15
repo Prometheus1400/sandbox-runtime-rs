@@ -18,13 +18,25 @@ pub use config::{
     SeccompConfig,
 };
 pub use error::{ConfigError, Result, SandboxError};
-pub use manager::SandboxManager;
+pub use manager::{SandboxManager, WrappedCommand};
 pub use violation::{SandboxViolationEvent, SandboxViolationStore};
+
+#[cfg(target_os = "macos")]
+pub use sandbox::macos::LogMonitor;
+
+#[cfg(target_os = "linux")]
+pub use sandbox::linux::LinuxLogMonitor;
 
 /// Re-export commonly used items.
 pub mod prelude {
     pub use crate::config::SandboxRuntimeConfig;
     pub use crate::error::{Result, SandboxError};
-    pub use crate::manager::SandboxManager;
+    pub use crate::manager::{SandboxManager, WrappedCommand};
     pub use crate::violation::{SandboxViolationEvent, SandboxViolationStore};
+
+    #[cfg(target_os = "macos")]
+    pub use crate::sandbox::macos::LogMonitor;
+
+    #[cfg(target_os = "linux")]
+    pub use crate::sandbox::linux::LinuxLogMonitor;
 }

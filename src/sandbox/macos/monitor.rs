@@ -140,4 +140,23 @@ mod tests {
         let decoded = decode_command_from_tag(&tag);
         assert_eq!(decoded, Some("echo hello".to_string()));
     }
+
+    #[test]
+    fn test_parse_violation_with_tag() {
+        let tag = "CMD64_dGVzdA==_END_12345678";
+        let line = format!("2026-03-14 sandbox: deny(1) file-write-data /tmp/foo {}", tag);
+        let event = parse_violation(&line, tag);
+        assert!(event.is_some());
+        let event = event.unwrap();
+        assert!(event.line.contains(tag));
+        assert_eq!(event.encoded_command, Some(tag.to_string()));
+    }
+
+    #[test]
+    fn test_parse_violation_without_tag() {
+        let tag = "CMD64_dGVzdA==_END_12345678";
+        let line = "2026-03-14 sandbox: deny(1) file-write-data /tmp/foo OTHER_TAG";
+        let event = parse_violation(line, tag);
+        assert!(event.is_none());
+    }
 }

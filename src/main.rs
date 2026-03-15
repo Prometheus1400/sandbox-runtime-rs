@@ -126,8 +126,8 @@ async fn main() -> ExitCode {
     };
 
     // Wrap and execute the command
-    let wrapped_command = match manager.wrap_with_sandbox(&command, None, None, &cwd).await {
-        Ok(cmd) => cmd,
+    let wrapped = match manager.wrap_with_sandbox(&command, None, None, &cwd).await {
+        Ok(w) => w,
         Err(e) => {
             eprintln!("Failed to wrap command: {}", e);
             manager.reset().await;
@@ -135,14 +135,37 @@ async fn main() -> ExitCode {
         }
     };
 
-    tracing::debug!("Wrapped command: {}", wrapped_command);
+    tracing::debug!("Wrapped command: {}", wrapped.command);
+    if let Some(ref tag) = wrapped.log_tag {
+        tracing::debug!("Violation monitor log tag: {}", tag);
+    }
 
     // Execute the wrapped command
-    let status = tokio::process::Command::new("sh")
+    // Use spawn+wait instead of status() so we can capture the child PID for Linux monitoring
+    let mut child = match tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(&wrapped_command)
-        .status()
-        .await;
+        .arg(&wrapped.command)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to spawn command: {}", e);
+            manager.reset().await;
+            return ExitCode::from(1);
+        }
+    };
+
+    // Start violation monitoring on Linux using the child PID
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pid) = child.id() {
+            if let Err(e) = manager.start_monitoring(None, Some(pid), &command).await {
+                tracing::warn!("Failed to start violation monitoring: {}", e);
+            }
+        }
+    }
+
+    let status = child.wait().await;
 
     // Cleanup: signal control fd reader to stop and reset sandbox manager
     if let Some(shutdown_tx) = control_fd_shutdown {

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-
 use crate::config::SandboxRuntimeConfig;
 use crate::proxy::{HttpProxy, Socks5Proxy};
 use crate::violation::SandboxViolationStore;
@@ -44,6 +43,9 @@ pub struct ManagerState {
 
     /// Violation store.
     pub violation_store: Arc<SandboxViolationStore>,
+
+    /// Handle for the active violation monitor task.
+    pub monitor_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ManagerState {
@@ -63,6 +65,7 @@ impl Default for ManagerState {
             initialized: false,
             network_ready: false,
             violation_store: Arc::new(SandboxViolationStore::new()),
+            monitor_task: None,
         }
     }
 }
@@ -75,6 +78,11 @@ impl ManagerState {
 
     /// Reset the state, cleaning up resources.
     pub async fn reset(&mut self) {
+        // Stop violation monitor
+        if let Some(handle) = self.monitor_task.take() {
+            handle.abort();
+        }
+
         // Stop proxies
         if let Some(ref mut proxy) = self.http_proxy {
             proxy.stop();

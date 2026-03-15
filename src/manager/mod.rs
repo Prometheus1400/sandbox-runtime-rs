@@ -18,6 +18,14 @@ use self::state::ManagerState;
 
 pub use filesystem::{FsReadRestrictionConfig, FsWriteRestrictionConfig};
 
+/// Result of wrapping a command with sandbox restrictions.
+pub struct WrappedCommand {
+    /// The wrapped command string ready for execution.
+    pub command: String,
+    /// Log tag for violation monitoring (macOS only).
+    pub log_tag: Option<String>,
+}
+
 /// The sandbox manager - main entry point for sandbox operations.
 pub struct SandboxManager {
     state: Arc<RwLock<ManagerState>>,
@@ -225,14 +233,85 @@ impl SandboxManager {
         self.state.read().violation_store.clone()
     }
 
+    /// Start monitoring for sandbox violations.
+    ///
+    /// On macOS, starts a `log stream` process filtered by the Seatbelt trace tag.
+    /// On Linux, starts `journalctl` filtered for seccomp audit messages.
+    /// On other platforms, this is a no-op.
+    pub async fn start_monitoring(
+        &self,
+        log_tag: Option<&str>,
+        child_pid: Option<u32>,
+        command: &str,
+    ) -> Result<(), SandboxError> {
+        // These params are used conditionally per platform
+        let _ = (&log_tag, &child_pid);
+
+        #[cfg(target_os = "macos")]
+        let rx = {
+            let tag = match log_tag {
+                Some(t) => t,
+                None => return Ok(()), // No tag on macOS means nothing to monitor
+            };
+            let (_, rx) = crate::sandbox::macos::LogMonitor::start(
+                tag.to_string(),
+                Some(command.to_string()),
+            )
+            .await?;
+            tracing::debug!("Started violation monitoring with tag: {}", tag);
+            rx
+        };
+
+        #[cfg(target_os = "linux")]
+        let rx = {
+            let (_, rx) = crate::sandbox::linux::LinuxLogMonitor::start(
+                child_pid,
+                Some(command.to_string()),
+            )
+            .await?;
+            tracing::debug!("Started seccomp violation monitoring (pid: {:?})", child_pid);
+            rx
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (log_tag, child_pid, command);
+            return Ok(());
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let store = self.get_violation_store();
+            let handle = tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(event) = rx.recv().await {
+                    store.add_violation(event);
+                }
+            });
+
+            // Abort any previous monitor before storing the new one
+            let mut state = self.state.write();
+            if let Some(prev) = state.monitor_task.take() {
+                prev.abort();
+            }
+            state.monitor_task = Some(handle);
+
+            Ok(())
+        }
+    }
+
     /// Wrap a command with sandbox restrictions.
+    ///
+    /// Returns a [`WrappedCommand`] containing the sandboxed command string and,
+    /// on macOS, the log tag used for violation monitoring. On macOS, violation
+    /// monitoring is automatically started.
     pub async fn wrap_with_sandbox(
         &self,
         command: &str,
         shell: Option<&str>,
         custom_config: Option<SandboxRuntimeConfig>,
         _cwd: &Path,
-    ) -> Result<String, SandboxError> {
+    ) -> Result<WrappedCommand, SandboxError> {
         // Extract needed values from state while holding the lock
         let (config, http_port, socks_port) = {
             let state = self.state.read();
@@ -256,7 +335,7 @@ impl SandboxManager {
         // Call platform-specific wrapper
         #[cfg(target_os = "macos")]
         {
-            let (wrapped, _log_tag) = crate::sandbox::macos::wrap_command(
+            let (wrapped, log_tag) = crate::sandbox::macos::wrap_command(
                 command,
                 &config,
                 http_port,
@@ -264,7 +343,18 @@ impl SandboxManager {
                 shell,
                 true, // enable log monitor
             )?;
-            Ok(wrapped)
+
+            // Automatically start violation monitoring if we have a log tag
+            if log_tag.is_some() {
+                if let Err(e) = self.start_monitoring(log_tag.as_deref(), None, command).await {
+                    tracing::warn!("Failed to start violation monitoring: {}", e);
+                }
+            }
+
+            Ok(WrappedCommand {
+                command: wrapped,
+                log_tag,
+            })
         }
 
         #[cfg(target_os = "linux")]
@@ -289,7 +379,10 @@ impl SandboxManager {
                 tracing::warn!("{}", warning);
             }
 
-            Ok(wrapped)
+            Ok(WrappedCommand {
+                command: wrapped,
+                log_tag: None,
+            })
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -330,6 +423,11 @@ impl SandboxManager {
         // We need to release the lock before calling async reset
         // So we'll just do the cleanup inline
 
+        // Stop violation monitor
+        if let Some(handle) = state.monitor_task.take() {
+            handle.abort();
+        }
+
         // Stop proxies
         if let Some(ref mut proxy) = state.http_proxy {
             proxy.stop();
@@ -363,5 +461,80 @@ impl SandboxManager {
 impl Drop for SandboxManager {
     fn drop(&mut self) {
         // Cleanup is handled by reset() or individual component Drop implementations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::violation::{SandboxViolationEvent, SandboxViolationStore};
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_wrapped_command_returns_log_tag_macos() {
+        // We can't fully test wrap_with_sandbox without initializing proxies,
+        // but we can verify the WrappedCommand struct supports log_tag
+        let wrapped = WrappedCommand {
+            command: "sandbox-exec -p '...' sh -c 'echo hello'".to_string(),
+            log_tag: Some("CMD64_test_END_12345678".to_string()),
+        };
+        assert!(wrapped.log_tag.is_some());
+        assert!(wrapped.log_tag.unwrap().contains("CMD64_"));
+    }
+
+    #[tokio::test]
+    async fn test_monitor_task_cleanup_on_reset() {
+        let manager = SandboxManager::new();
+
+        // Manually set a monitor task
+        {
+            let handle = tokio::spawn(async {
+                // Simulate a long-running monitor
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+            let mut state = manager.state.write();
+            state.monitor_task = Some(handle);
+        }
+
+        // Verify monitor task is set
+        assert!(manager.state.read().monitor_task.is_some());
+
+        // Reset should abort and clear the monitor task
+        manager.reset().await;
+
+        assert!(manager.state.read().monitor_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_violation_store_integration() {
+        let store = Arc::new(SandboxViolationStore::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        // Simulate the drain task pattern used in start_monitoring
+        let store_clone = store.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                store_clone.add_violation(event);
+            }
+        });
+
+        // Send violations through the channel
+        tx.send(SandboxViolationEvent::new("violation 1".to_string()))
+            .await
+            .unwrap();
+        tx.send(SandboxViolationEvent::new("violation 2".to_string()))
+            .await
+            .unwrap();
+
+        // Drop sender to close the channel
+        drop(tx);
+
+        // Wait for drain task to finish
+        handle.await.unwrap();
+
+        assert_eq!(store.get_count(), 2);
+        let violations = store.get_violations(None);
+        assert_eq!(violations[0].line, "violation 1");
+        assert_eq!(violations[1].line, "violation 2");
     }
 }
