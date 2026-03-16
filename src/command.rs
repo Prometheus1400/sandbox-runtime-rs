@@ -19,6 +19,9 @@ use crate::utils::{current_platform, join_args, Platform};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "linux")]
+const SECCOMP_DIAGNOSTIC_SNIPPET_LIMIT: usize = 512;
+
 pub struct SandboxedCommand {
     program: String,
     args: Vec<String>,
@@ -372,6 +375,12 @@ impl SandboxedCommand {
         for warning in warnings {
             tracing::warn!("{warning}");
         }
+        tracing::debug!(
+            runner_path = %runner_path.display(),
+            notify_fd = child_fd,
+            wrapped_command = %wrapped,
+            "starting linux sandbox via seccomp runner"
+        );
 
         let mut inner = Command::new("sh");
         inner.arg("-c").arg(wrapped);
@@ -395,8 +404,25 @@ impl SandboxedCommand {
         drop(child_sock); // Close child end in parent
 
         // Receive the seccomp listener fd from the runner via SCM_RIGHTS
-        let listener_fd = recv_fd(&parent_sock)?;
+        tracing::debug!("waiting for seccomp listener fd from runner");
+        let listener_fd = match recv_fd(&parent_sock) {
+            Ok(fd) => fd,
+            Err(recv_error) => {
+                drop(parent_sock);
+                let error = collect_seccomp_startup_error(
+                    &mut child,
+                    recv_error,
+                    &wrapped,
+                    &runner_path,
+                    child_fd,
+                )
+                .await;
+                let _ = std::fs::remove_file(&runner_path);
+                return Err(error);
+            }
+        };
         drop(parent_sock);
+        tracing::debug!("received seccomp listener fd from runner");
 
         // Clean up runner binary — the child has already exec'd it
         let _ = std::fs::remove_file(&runner_path);
@@ -438,7 +464,7 @@ impl SandboxedCommand {
 #[cfg(target_os = "linux")]
 fn recv_fd(
     sock: &std::os::unix::net::UnixStream,
-) -> Result<std::os::fd::OwnedFd, SandboxError> {
+) -> Result<std::os::fd::OwnedFd, SeccompFdReceiveError> {
     use nix::cmsg_space;
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -453,19 +479,187 @@ fn recv_fd(
         Some(&mut cmsg_buf),
         MsgFlags::empty(),
     )
-    .map_err(|e| SandboxError::Seccomp(format!("recvmsg for listener fd: {e}")))?;
+    .map_err(|e| SeccompFdReceiveError {
+        summary: format!("recvmsg for listener fd failed: {e}"),
+        bytes: None,
+        flags: None,
+        ancillary: None,
+    })?;
 
+    let mut ancillary = Vec::new();
     for cmsg in msg.cmsgs() {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            if let Some(&fd) = fds.first() {
-                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        match cmsg {
+            ControlMessageOwned::ScmRights(fds) => {
+                ancillary.push(format!("SCM_RIGHTS({})", fds.len()));
+                if let Some(&fd) = fds.first() {
+                    return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
             }
+            other => ancillary.push(format!("{other:?}")),
         }
     }
 
-    Err(SandboxError::Seccomp(
-        "no listener fd received from seccomp runner".into(),
+    Err(SeccompFdReceiveError {
+        summary: "no listener fd received from seccomp runner".into(),
+        bytes: Some(msg.bytes),
+        flags: Some(format!("{:?}", msg.flags)),
+        ancillary: Some(if ancillary.is_empty() {
+            "none".into()
+        } else {
+            ancillary.join(", ")
+        }),
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SeccompFdReceiveError {
+    summary: String,
+    bytes: Option<usize>,
+    flags: Option<String>,
+    ancillary: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+async fn collect_seccomp_startup_error(
+    child: &mut tokio::process::Child,
+    recv_error: SeccompFdReceiveError,
+    wrapped_command: &str,
+    runner_path: &Path,
+    notify_fd: i32,
+) -> SandboxError {
+    use tokio::io::AsyncReadExt;
+
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout_pipe = child.stdout.take();
+
+    let mut status = match child.try_wait() {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!("failed to query seccomp runner child status: {err}");
+            None
+        }
+    };
+
+    if status.is_none() {
+        let _ = child.start_kill();
+        status = match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await
+        {
+            Ok(Ok(exit_status)) => Some(exit_status),
+            Ok(Err(err)) => {
+                tracing::warn!("failed to wait for seccomp runner child after startup error: {err}");
+                None
+            }
+            Err(_) => None,
+        };
+    }
+
+    let stderr = if let Some(mut pipe) = stderr_pipe.take() {
+        let mut buf = Vec::new();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            pipe.read_to_end(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Some(buf),
+            Ok(Err(err)) => Some(format!("failed to read stderr: {err}").into_bytes()),
+            Err(_) => Some(b"<stderr read timed out>".to_vec()),
+        }
+    } else {
+        None
+    };
+
+    let stdout = if let Some(mut pipe) = stdout_pipe.take() {
+        let mut buf = Vec::new();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            pipe.read_to_end(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Some(buf),
+            Ok(Err(err)) => Some(format!("failed to read stdout: {err}").into_bytes()),
+            Err(_) => Some(b"<stdout read timed out>".to_vec()),
+        }
+    } else {
+        None
+    };
+
+    let message = format_seccomp_startup_error(
+        &recv_error,
+        status.as_ref().map(ToString::to_string).as_deref(),
+        stderr.as_deref(),
+        stdout.as_deref(),
+        wrapped_command,
+        &runner_path.display().to_string(),
+        notify_fd,
+    );
+    tracing::warn!("{message}");
+    SandboxError::Seccomp(message)
+}
+
+#[cfg(target_os = "linux")]
+fn format_seccomp_startup_error(
+    recv_error: &SeccompFdReceiveError,
+    child_status: Option<&str>,
+    stderr: Option<&[u8]>,
+    stdout: Option<&[u8]>,
+    wrapped_command: &str,
+    runner_path: &str,
+    notify_fd: i32,
+) -> String {
+    let mut parts = vec![format!("seccomp runner startup failed: {}", recv_error.summary)];
+
+    if let Some(bytes) = recv_error.bytes {
+        parts.push(format!("recvmsg_bytes={bytes}"));
+    }
+    if let Some(flags) = recv_error.flags.as_deref() {
+        parts.push(format!("recvmsg_flags={flags}"));
+    }
+    if let Some(ancillary) = recv_error.ancillary.as_deref() {
+        parts.push(format!("recvmsg_ancillary={ancillary}"));
+    }
+    if let Some(status) = child_status {
+        parts.push(format!("child_status={status}"));
+    } else {
+        parts.push("child_status=<unavailable>".into());
+    }
+    if let Some(stderr) = summarize_output(stderr) {
+        parts.push(format!("stderr={stderr}"));
+    }
+    if let Some(stdout) = summarize_output(stdout) {
+        parts.push(format!("stdout={stdout}"));
+    }
+    parts.push(format!("runner_path={runner_path}"));
+    parts.push(format!("notify_fd={notify_fd}"));
+    parts.push(format!(
+        "command={}",
+        summarize_text(wrapped_command, SECCOMP_DIAGNOSTIC_SNIPPET_LIMIT)
+    ));
+
+    parts.join("; ")
+}
+
+#[cfg(target_os = "linux")]
+fn summarize_output(bytes: Option<&[u8]>) -> Option<String> {
+    let bytes = bytes?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(summarize_text(
+        &String::from_utf8_lossy(bytes),
+        SECCOMP_DIAGNOSTIC_SNIPPET_LIMIT,
     ))
+}
+
+fn summarize_text(text: &str, max_len: usize) -> String {
+    let sanitized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if sanitized.len() <= max_len {
+        sanitized
+    } else {
+        format!("{}...", &sanitized[..max_len])
+    }
 }
 
 /// Sandbox-related error patterns in stderr that indicate a violation occurred
@@ -500,4 +694,42 @@ fn detect_stderr_violations(stderr: &str) -> Vec<SandboxViolationEvent> {
         }
     }
     violations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_summarize_text_collapses_whitespace_and_truncates() {
+        assert_eq!(summarize_text("hello\n  world", 32), "hello world");
+        assert_eq!(summarize_text("abcdef", 4), "abcd...");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_format_seccomp_startup_error_includes_diagnostics() {
+        let message = format_seccomp_startup_error(
+            &SeccompFdReceiveError {
+                summary: "no listener fd received from seccomp runner".into(),
+                bytes: Some(0),
+                flags: Some("MsgFlags(0x0)".into()),
+                ancillary: Some("none".into()),
+            },
+            Some("exit status: 67"),
+            Some(b"seccomp(SECCOMP_SET_MODE_FILTER): Invalid argument\n"),
+            Some(b""),
+            "bwrap --preserve-fd 42 -- sh -c 'runner'",
+            "/tmp/seccomp-runner",
+            42,
+        );
+
+        assert!(message.contains("no listener fd received from seccomp runner"));
+        assert!(message.contains("recvmsg_bytes=0"));
+        assert!(message.contains("child_status=exit status: 67"));
+        assert!(message.contains("stderr=seccomp(SECCOMP_SET_MODE_FILTER): Invalid argument"));
+        assert!(message.contains("runner_path=/tmp/seccomp-runner"));
+        assert!(message.contains("notify_fd=42"));
+        assert!(message.contains("command=bwrap --preserve-fd 42"));
+    }
 }
