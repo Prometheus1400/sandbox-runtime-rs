@@ -279,13 +279,13 @@ async fn test_successful_process_no_false_violations() {
 #[tokio::test]
 #[ignore]
 async fn test_linux_write_violation_reports_execution_violation() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let canonical_dir = dir.path().canonicalize().expect("canonicalize tempdir");
-    let file_path = canonical_dir.join("forbidden.txt");
-
+    // Write directly to /tmp/forbidden.txt rather than a tempdir subdirectory.
+    // bwrap mounts a fresh tmpfs on /tmp, so host tempdirs don't exist inside
+    // the sandbox. /tmp itself exists and seccomp will intercept the write
+    // syscall before it completes since no allow_write is configured.
     let result = SandboxedCommand::new("sh")
         .arg("-c")
-        .arg(format!("echo denied > {}", file_path.display()))
+        .arg("echo denied > /tmp/forbidden.txt")
         .allow_read("/")
         .output()
         .await;
