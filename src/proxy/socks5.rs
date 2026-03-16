@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::error::SandboxError;
+use crate::error::{SandboxError, SandboxViolationEvent};
 use crate::proxy::filter::{DomainFilter, FilterDecision};
+use crate::violation::proxy_network_denied_event;
 
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -28,11 +29,15 @@ pub struct Socks5Proxy {
     port: u16,
     filter: Arc<DomainFilter>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 }
 
 impl Socks5Proxy {
     /// Create a new SOCKS5 proxy server.
-    pub async fn new(filter: DomainFilter) -> Result<Self, SandboxError> {
+    pub async fn new(
+        filter: DomainFilter,
+        violations_tx: mpsc::Sender<SandboxViolationEvent>,
+    ) -> Result<Self, SandboxError> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
 
@@ -43,6 +48,7 @@ impl Socks5Proxy {
             port,
             filter: Arc::new(filter),
             shutdown_tx: None,
+            violations_tx,
         })
     }
 
@@ -59,6 +65,7 @@ impl Socks5Proxy {
             .ok_or_else(|| SandboxError::Proxy("Proxy already started".to_string()))?;
 
         let filter = self.filter.clone();
+        let violations_tx = self.violations_tx.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -69,8 +76,9 @@ impl Socks5Proxy {
                         match accept_result {
                             Ok((stream, addr)) => {
                                 let filter = filter.clone();
+                                let vtx = violations_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_client(stream, addr, filter).await {
+                                    if let Err(e) = handle_client(stream, addr, filter, vtx).await {
                                         tracing::debug!("SOCKS5 error from {}: {}", addr, e);
                                     }
                                 });
@@ -104,6 +112,7 @@ async fn handle_client(
     mut stream: TcpStream,
     _addr: SocketAddr,
     filter: Arc<DomainFilter>,
+    violations_tx: mpsc::Sender<SandboxViolationEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read version and authentication methods
     let mut header = [0u8; 2];
@@ -199,6 +208,12 @@ async fn handle_client(
 
     if matches!(decision, FilterDecision::Deny) {
         tracing::debug!("SOCKS5 denied connection to {}:{}", host, port);
+        let _ = violations_tx
+            .send(proxy_network_denied_event(
+                "connect",
+                format!("{}:{}", host, port),
+            ))
+            .await;
         send_reply(&mut stream, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0).await?;
         return Ok(());
     }

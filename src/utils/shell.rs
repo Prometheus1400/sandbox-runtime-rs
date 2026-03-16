@@ -14,13 +14,6 @@ pub fn quote(s: &str) -> String {
     }
 
     // Use single quotes and escape any existing single quotes
-    // 'abc' -> 'abc'
-    // abc's -> 'abc'"'"'s'
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
-
-/// Quote a string for use as a shell argument, always using quotes.
-pub fn quote_always(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
@@ -69,12 +62,6 @@ where
         .join(" ")
 }
 
-/// Parse a shell command string into arguments.
-/// Uses shell-words crate for proper handling.
-pub fn split_args(s: &str) -> Result<Vec<String>, shell_words::ParseError> {
-    shell_words::split(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,11 +79,5 @@ mod tests {
     fn test_join_args() {
         let args = vec!["echo", "hello world", "it's"];
         assert_eq!(join_args(args), "echo 'hello world' 'it'\"'\"'s'");
-    }
-
-    #[test]
-    fn test_split_args() {
-        let args = split_args("echo 'hello world' test").unwrap();
-        assert_eq!(args, vec!["echo", "hello world", "test"]);
     }
 }

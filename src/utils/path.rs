@@ -1,6 +1,7 @@
 //! Path normalization utilities.
 
-use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "linux"))]
+use std::path::{Component, Path, PathBuf};
 
 /// Normalize a path for sandbox use.
 /// - Expands ~ to home directory
@@ -30,86 +31,63 @@ pub fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
-/// Normalize case for path comparison on case-insensitive filesystems.
-pub fn normalize_case_for_comparison(path: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        path.to_lowercase()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        path.to_string()
-    }
-}
-
 /// Check if a path contains glob characters.
 pub fn contains_glob_chars(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
 }
 
-/// Remove trailing glob suffix (e.g., /** or /*)
+/// Normalize path components lexically without touching the filesystem.
+#[cfg(any(test, target_os = "linux"))]
+pub fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
+/// Strip trailing glob components from a path.
+///
+/// For example, `/foo/bar/**` becomes `/foo/bar` and `/foo/*/baz` becomes `/foo`.
+/// Used to extract the base directory from a glob pattern for bind-mounting.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn remove_trailing_glob_suffix(path: &str) -> String {
-    let mut result = path.to_string();
-
-    // Remove trailing /**
-    while result.ends_with("/**") {
-        result = result[..result.len() - 3].to_string();
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut base_parts = Vec::new();
+    for part in &parts {
+        if contains_glob_chars(part) {
+            break;
+        }
+        base_parts.push(*part);
     }
-
-    // Remove trailing /*
-    while result.ends_with("/*") {
-        result = result[..result.len() - 2].to_string();
-    }
-
-    result
-}
-
-/// Check if a resolved symlink path is outside the original path boundary.
-/// This prevents escaping the sandbox via symlinks.
-pub fn is_symlink_outside_boundary(original: &Path, resolved: &Path) -> bool {
-    // If the resolved path is an ancestor of or equal to root, it's outside
-    if resolved == Path::new("/") {
-        return true;
-    }
-
-    // Check if resolved is an ancestor of original
-    if original.starts_with(resolved) && original != resolved {
-        return true;
-    }
-
-    false
-}
-
-/// Get the parent directory path, handling root correctly.
-pub fn get_parent_path(path: &Path) -> Option<&Path> {
-    let parent = path.parent()?;
-    if parent.as_os_str().is_empty() {
-        None
+    let result = base_parts.join("/");
+    if result.is_empty() {
+        "/".to_string()
     } else {
-        Some(parent)
+        result
     }
 }
 
-/// Join paths, handling absolute paths correctly.
-pub fn join_paths<P: AsRef<Path>>(base: &Path, path: P) -> PathBuf {
-    let path = path.as_ref();
-    if path.is_absolute() {
-        path.to_path_buf()
+/// Check if a resolved (canonicalized) path escapes the boundary of the original path's parent.
+///
+/// Returns `true` if the symlink target is outside the parent directory of `path`.
+#[cfg(target_os = "linux")]
+pub fn is_symlink_outside_boundary(path: &std::path::Path, resolved: &std::path::Path) -> bool {
+    if let Some(parent) = path.parent() {
+        !resolved.starts_with(parent)
     } else {
-        base.join(path)
+        // Root path — resolved can't escape
+        false
     }
-}
-
-/// Check if a path is a symlink.
-pub fn is_symlink(path: &Path) -> bool {
-    path.symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// Resolve a symlink to its target, if it is one.
-pub fn resolve_symlink(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::read_link(path)
 }
 
 #[cfg(test)]
@@ -140,10 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_trailing_glob_suffix() {
-        assert_eq!(remove_trailing_glob_suffix("/path/**"), "/path");
-        assert_eq!(remove_trailing_glob_suffix("/path/*"), "/path");
-        assert_eq!(remove_trailing_glob_suffix("/path/**/**"), "/path");
-        assert_eq!(remove_trailing_glob_suffix("/path"), "/path");
+    fn test_normalize_path_components() {
+        let path = Path::new("/tmp/../var/./log");
+        assert_eq!(normalize_path_components(path), PathBuf::from("/var/log"));
     }
 }

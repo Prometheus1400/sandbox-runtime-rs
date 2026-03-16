@@ -7,7 +7,7 @@ use crate::config::{FilesystemConfig, RipgrepConfig, DANGEROUS_DIRECTORIES, DANG
 use crate::error::SandboxError;
 use crate::utils::{
     contains_glob_chars, find_dangerous_files, is_symlink_outside_boundary,
-    normalize_path_for_sandbox, remove_trailing_glob_suffix,
+    normalize_path_for_sandbox,
 };
 
 /// Bind mount specification.
@@ -21,6 +21,22 @@ pub struct BindMount {
     pub readonly: bool,
     /// Whether to create the path with dev-null if it doesn't exist.
     pub dev_null: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinuxWritePolicy {
+    allowed: Vec<PathBuf>,
+    denied: Vec<PathBuf>,
+}
+
+impl LinuxWritePolicy {
+    pub fn allows(&self, path: &Path) -> bool {
+        if self.denied.iter().any(|prefix| path.starts_with(prefix)) {
+            return false;
+        }
+
+        self.allowed.iter().any(|prefix| path.starts_with(prefix))
+    }
 }
 
 impl BindMount {
@@ -91,79 +107,9 @@ pub fn generate_bind_mounts(
     let mut mounts = Vec::new();
     let mut warnings = Vec::new();
 
-    // Collect all paths that need to be writable
-    let mut writable_paths: HashSet<PathBuf> = HashSet::new();
-    for path in &config.allow_write {
-        // Handle glob patterns
-        if contains_glob_chars(path) {
-            warnings.push(format!(
-                "Glob pattern '{}' is not supported on Linux; ignoring",
-                path
-            ));
-            continue;
-        }
-
-        let normalized = normalize_path_for_sandbox(path);
-        let path = PathBuf::from(&normalized);
-
-        if path.exists() {
-            writable_paths.insert(path);
-        } else {
-            warnings.push(format!("Write path '{}' does not exist", normalized));
-        }
-    }
-
-    // Collect all paths that need to be denied write access
-    let mut deny_paths: HashSet<PathBuf> = HashSet::new();
-    for path in &config.deny_write {
-        if contains_glob_chars(path) {
-            warnings.push(format!(
-                "Glob pattern '{}' is not supported on Linux; ignoring",
-                path
-            ));
-            continue;
-        }
-
-        let normalized = normalize_path_for_sandbox(path);
-        deny_paths.insert(PathBuf::from(&normalized));
-    }
-
-    // Find dangerous files using ripgrep
-    let dangerous_files = find_dangerous_files(cwd, ripgrep_config, max_depth).unwrap_or_default();
-    for file in dangerous_files {
-        deny_paths.insert(PathBuf::from(file));
-    }
-
-    // Add mandatory deny paths
-    for dir in DANGEROUS_DIRECTORIES {
-        // Check in cwd
-        let path = cwd.join(dir);
-        if path.exists() {
-            deny_paths.insert(path);
-        }
-
-        // Check in home
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(dir);
-            if path.exists() {
-                deny_paths.insert(path);
-            }
-        }
-    }
-
-    for file in DANGEROUS_FILES {
-        // Skip .gitconfig if allowed
-        if *file == ".gitconfig" && config.allow_git_config.unwrap_or(false) {
-            continue;
-        }
-
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(file);
-            if path.exists() {
-                deny_paths.insert(path);
-            }
-        }
-    }
+    let (writable_paths, deny_paths, mut policy_warnings) =
+        collect_linux_write_paths(config, cwd, ripgrep_config, max_depth);
+    warnings.append(&mut policy_warnings);
 
     // Generate mounts
     // First, add writable mounts
@@ -192,6 +138,101 @@ pub fn generate_bind_mounts(
     Ok((mounts, warnings))
 }
 
+pub fn build_linux_write_policy(
+    config: &FilesystemConfig,
+    cwd: &Path,
+    ripgrep_config: Option<&RipgrepConfig>,
+    max_depth: Option<u32>,
+) -> (LinuxWritePolicy, Vec<String>) {
+    let (allowed, denied, warnings) =
+        collect_linux_write_paths(config, cwd, ripgrep_config, max_depth);
+
+    (
+        LinuxWritePolicy {
+            allowed: allowed.into_iter().collect(),
+            denied: denied.into_iter().collect(),
+        },
+        warnings,
+    )
+}
+
+fn collect_linux_write_paths(
+    config: &FilesystemConfig,
+    cwd: &Path,
+    ripgrep_config: Option<&RipgrepConfig>,
+    max_depth: Option<u32>,
+) -> (HashSet<PathBuf>, HashSet<PathBuf>, Vec<String>) {
+    let mut writable_paths: HashSet<PathBuf> = HashSet::new();
+    let mut deny_paths: HashSet<PathBuf> = HashSet::new();
+    let mut warnings = Vec::new();
+
+    for path in &config.allow_write {
+        if contains_glob_chars(path) {
+            warnings.push(format!(
+                "Glob pattern '{}' is not supported on Linux; ignoring",
+                path
+            ));
+            continue;
+        }
+
+        let normalized = normalize_path_for_sandbox(path);
+        let path = PathBuf::from(&normalized);
+
+        if path.exists() {
+            writable_paths.insert(path);
+        } else {
+            warnings.push(format!("Write path '{}' does not exist", normalized));
+        }
+    }
+
+    for path in &config.deny_write {
+        if contains_glob_chars(path) {
+            warnings.push(format!(
+                "Glob pattern '{}' is not supported on Linux; ignoring",
+                path
+            ));
+            continue;
+        }
+
+        let normalized = normalize_path_for_sandbox(path);
+        deny_paths.insert(PathBuf::from(&normalized));
+    }
+
+    let dangerous_files = find_dangerous_files(cwd, ripgrep_config, max_depth).unwrap_or_default();
+    for file in dangerous_files {
+        deny_paths.insert(PathBuf::from(file));
+    }
+
+    for dir in DANGEROUS_DIRECTORIES {
+        let path = cwd.join(dir);
+        if path.exists() {
+            deny_paths.insert(path);
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(dir);
+            if path.exists() {
+                deny_paths.insert(path);
+            }
+        }
+    }
+
+    for file in DANGEROUS_FILES {
+        if *file == ".gitconfig" && config.allow_git_config.unwrap_or(false) {
+            continue;
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(file);
+            if path.exists() {
+                deny_paths.insert(path);
+            }
+        }
+    }
+
+    (writable_paths, deny_paths, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +250,17 @@ mod tests {
         let mount = BindMount::block("/path/to/blocked");
         let args = mount.to_bwrap_args();
         assert_eq!(args, vec!["--ro-bind", "/dev/null", "/path/to/blocked"]);
+    }
+
+    #[test]
+    fn test_linux_write_policy_denied_overrides_allowed() {
+        let policy = LinuxWritePolicy {
+            allowed: vec![PathBuf::from("/tmp/workspace")],
+            denied: vec![PathBuf::from("/tmp/workspace/.git")],
+        };
+
+        assert!(policy.allows(Path::new("/tmp/workspace/output.txt")));
+        assert!(!policy.allows(Path::new("/tmp/workspace/.git/config")));
+        assert!(!policy.allows(Path::new("/etc/passwd")));
     }
 }

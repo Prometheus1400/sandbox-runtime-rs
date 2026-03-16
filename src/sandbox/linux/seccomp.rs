@@ -1,5 +1,7 @@
 //! Seccomp filter loading and management.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -9,10 +11,17 @@ use crate::config::SeccompConfig;
 use crate::error::SandboxError;
 use crate::utils::get_arch;
 
+#[cfg(target_os = "linux")]
+const SECCOMP_RUNNER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp-runner"));
+
+#[cfg(target_os = "linux")]
+const SECCOMP_BPF_FILTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unix-block.bpf"));
+
 /// Cache for BPF path lookups (key: explicit path or empty string, value: resolved path or None)
 static BPF_PATH_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+#[allow(dead_code)]
 /// Cache for apply-seccomp binary path lookups
 static APPLY_SECCOMP_PATH_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -44,7 +53,10 @@ fn get_local_seccomp_paths(filename: &str) -> Vec<PathBuf> {
 
     // Fallback: check cargo install location
     if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(format!(".cargo/share/sandbox-runtime/seccomp/{}/{}", arch, filename)));
+        paths.push(home.join(format!(
+            ".cargo/share/sandbox-runtime/seccomp/{}/{}",
+            arch, filename
+        )));
     }
 
     paths
@@ -56,7 +68,10 @@ fn find_bpf_path(explicit_path: Option<&str>) -> Option<PathBuf> {
     if let Some(path_str) = explicit_path {
         let p = PathBuf::from(path_str);
         if p.exists() {
-            tracing::debug!("[SeccompFilter] Using BPF filter from explicit path: {:?}", p);
+            tracing::debug!(
+                "[SeccompFilter] Using BPF filter from explicit path: {:?}",
+                p
+            );
             return Some(p);
         }
         tracing::debug!(
@@ -86,6 +101,21 @@ fn find_bpf_path(explicit_path: Option<&str>) -> Option<PathBuf> {
         }
     }
 
+    // Fallback: extract embedded BPF filter
+    #[cfg(target_os = "linux")]
+    {
+        tracing::debug!(
+            "[SeccompFilter] Pre-generated BPF filter not found on disk, extracting embedded filter ({})",
+            arch
+        );
+        match extract_bpf_filter() {
+            Ok(path) => return Some(path),
+            Err(e) => {
+                tracing::warn!("[SeccompFilter] Failed to extract embedded BPF filter: {}", e);
+            }
+        }
+    }
+
     tracing::debug!(
         "[SeccompFilter] Pre-generated BPF filter not found in any expected location ({})",
         arch
@@ -93,6 +123,7 @@ fn find_bpf_path(explicit_path: Option<&str>) -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)]
 /// Find the apply-seccomp binary path without caching (internal implementation).
 fn find_apply_seccomp_path(explicit_path: Option<&str>) -> Option<PathBuf> {
     // Check explicit path first (highest priority)
@@ -173,6 +204,7 @@ pub fn get_bpf_path(config: Option<&SeccompConfig>) -> Result<PathBuf, SandboxEr
     })
 }
 
+#[allow(dead_code)]
 /// Get the path to the apply-seccomp binary for the current architecture.
 /// Results are cached for performance.
 pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf, SandboxError> {
@@ -181,7 +213,9 @@ pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf,
 
     // Check cache first
     {
-        let cache = APPLY_SECCOMP_PATH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = APPLY_SECCOMP_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache.get(&cache_key) {
             return cached.clone().ok_or_else(|| {
                 SandboxError::Seccomp(format!(
@@ -195,7 +229,9 @@ pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf,
     // Find path and cache result
     let result = find_apply_seccomp_path(explicit_path);
     {
-        let mut cache = APPLY_SECCOMP_PATH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = APPLY_SECCOMP_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.insert(cache_key, result.clone());
     }
 
@@ -207,9 +243,45 @@ pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf,
     })
 }
 
+#[allow(dead_code)]
 /// Check if seccomp is available on the current system.
 pub fn is_seccomp_available(config: Option<&SeccompConfig>) -> bool {
     get_bpf_path(config).is_ok() && get_apply_seccomp_path(config).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn extract_seccomp_runner() -> Result<PathBuf, SandboxError> {
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let suffix: u32 = rng.gen();
+    let path = PathBuf::from(format!(
+        "/var/tmp/srt-seccomp-runner-{}-{:08x}",
+        std::process::id(),
+        suffix
+    ));
+
+    std::fs::write(&path, SECCOMP_RUNNER_BIN)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+/// Extract the embedded BPF filter to a temporary file.
+/// Used as a fallback when the filter can't be found on disk.
+#[cfg(target_os = "linux")]
+pub fn extract_bpf_filter() -> Result<PathBuf, SandboxError> {
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let suffix: u32 = rng.gen();
+    let path = PathBuf::from(format!(
+        "/var/tmp/srt-bpf-{}-{:08x}",
+        std::process::id(),
+        suffix
+    ));
+
+    std::fs::write(&path, SECCOMP_BPF_FILTER)?;
+    Ok(path)
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ impl DomainFilter {
     }
 
     /// Create an allow-all filter.
+    #[cfg(test)]
     pub fn allow_all() -> Self {
         Self {
             allowed_domains: vec![],
@@ -77,20 +78,6 @@ impl DomainFilter {
         FilterDecision::Allow
     }
 
-    /// Check if a domain is allowed.
-    pub fn is_allowed(&self, hostname: &str, port: u16) -> bool {
-        matches!(self.check(hostname, port), FilterDecision::Allow | FilterDecision::Mitm)
-    }
-
-    /// Check if a domain should be routed through MITM.
-    pub fn should_mitm(&self, hostname: &str) -> bool {
-        for pattern in &self.mitm_domains {
-            if matches_domain_pattern(hostname, pattern) {
-                return true;
-            }
-        }
-        false
-    }
 }
 
 #[cfg(test)]
@@ -113,7 +100,10 @@ mod tests {
         };
 
         assert_eq!(filter.check("github.com", 443), FilterDecision::Allow);
-        assert_eq!(filter.check("registry.npmjs.org", 443), FilterDecision::Allow);
+        assert_eq!(
+            filter.check("registry.npmjs.org", 443),
+            FilterDecision::Allow
+        );
         assert_eq!(filter.check("evil.com", 443), FilterDecision::Deny);
     }
 
@@ -138,6 +128,9 @@ mod tests {
         };
 
         assert_eq!(filter.check("api.example.com", 443), FilterDecision::Mitm);
-        assert_eq!(filter.check("other.example.com", 443), FilterDecision::Allow);
+        assert_eq!(
+            filter.check("other.example.com", 443),
+            FilterDecision::Allow
+        );
     }
 }

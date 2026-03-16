@@ -21,30 +21,54 @@ This project is a **Rust implementation** of [sandbox-runtime](https://github.co
 
 ```bash
 cargo build                   # Debug build
-cargo build --release         # Release build (binary: target/release/srt)
-cargo test                    # Run all tests
+cargo build --release         # Release build
+cargo test                    # Run all tests (unit + doc)
+cargo test -- --ignored --test-threads=1  # Run sandbox integration tests (macOS)
 cargo test config::           # Run specific module tests
 cargo test -- --nocapture     # Run with output visible
 cargo clippy                  # Lint
 ```
 
-## Running the CLI
+## Library Usage
 
-```bash
-cargo run -- -c 'echo hello'              # Run command in sandbox
-cargo run -- -d -c 'curl example.com'     # Debug mode
-cargo run -- -s settings.json -c 'cmd'    # Custom settings file
+This is a **library crate** with a declarative builder-pattern API:
+
+```rust
+use sandbox_runtime::{SandboxedCommand, SandboxError};
+
+let output = SandboxedCommand::new("echo")
+    .arg("hello")
+    .allow_read("/usr")
+    .allow_write("/tmp")
+    .allow_domain("example.com")
+    .output()
+    .await?;
 ```
+
+Key public types: `SandboxedCommand`, `SandboxedChild`, `SandboxedOutput`, `SandboxRuntimeConfig`, `SandboxError`, `SandboxViolationEvent`.
 
 ## Architecture
 
-OS-level sandboxing tool enforcing filesystem and network restrictions without containerization. Uses proxy-based network filtering (portable, no root required) with platform-specific sandboxing.
+OS-level sandboxing library enforcing filesystem and network restrictions without containerization. Uses proxy-based network filtering (portable, no root required) with platform-specific sandboxing.
 
 ### Core Flow
 
-1. `SandboxManager::initialize()` - Starts HTTP/SOCKS5 proxies, validates config
-2. `SandboxManager::wrap_with_sandbox()` - Generates platform-specific wrapped command
-3. Wrapped command runs with proxy env vars (`http_proxy`, `https_proxy`, `ALL_PROXY`)
+1. `SandboxedCommand::spawn()` - Validates config, starts HTTP/SOCKS5 proxies, wraps command with platform sandbox
+2. Returns `SandboxedChild` with stdin/stdout/stderr handles and violation stream
+3. `SandboxedCommand::output()` - Convenience: spawn + wait + collect output
+
+### Module Visibility
+
+| Module | Visibility | Purpose |
+|--------|-----------|---------|
+| `command` | **pub** | `SandboxedCommand` builder API |
+| `child` | **pub** | `SandboxedChild` process handle |
+| `config` | **pub** | Configuration types and validation |
+| `error` | **pub** | Error types and `SandboxViolationEvent` |
+| `manager` | pub(crate) | Proxy initialization |
+| `proxy` | pub(crate) | HTTP/SOCKS5 proxy with domain filtering |
+| `sandbox` | pub(crate) | Platform-specific sandboxing |
+| `utils` | pub(crate) | Path, shell, platform utilities |
 
 ### Platform Implementations
 
@@ -57,16 +81,6 @@ OS-level sandboxing tool enforcing filesystem and network restrictions without c
 - Uses bubblewrap + seccomp
 - `bwrap.rs`: generates bwrap command with `--unshare-net`, bind mounts
 - `bridge.rs`: socat bridges for proxy access inside namespace
-
-### Key Modules
-
-| Module | Purpose |
-|--------|---------|
-| `manager/` | Orchestration: proxy init, command wrapping, state |
-| `proxy/filter.rs` | Domain filtering: allowlist/denylist/MITM decisions |
-| `config/schema.rs` | Configuration types, validation, dangerous paths |
-| `sandbox/macos/profile.rs` | Seatbelt SBPL profile generation |
-| `sandbox/linux/bwrap.rs` | Bubblewrap command construction |
 
 ### Domain Filter Priority (`src/proxy/filter.rs`)
 
@@ -84,7 +98,7 @@ Always write-protected: `.gitconfig`, `.bashrc`, `.zshrc`, `.npmrc`, `.mcp.json`
 
 - Platform code: `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "linux")]`
 - Config JSON uses camelCase: `#[serde(rename_all = "camelCase")]`
-- Async: `tokio`, Errors: `thiserror`, Logging: `tracing`, Locks: `parking_lot`
+- Async: `tokio`, Errors: `thiserror`, Logging: `tracing`
 
 ## Modifying Sandbox Behavior
 
@@ -100,9 +114,6 @@ Always write-protected: `.gitconfig`, `.bashrc`, `.zshrc`, `.npmrc`, `.mcp.json`
 ## Debugging
 
 ```bash
-cargo run -- -d -c 'command'   # Debug logging via -d flag
-RUST_LOG=debug cargo run -- -c 'command'
-
 # macOS: Watch sandbox violations
 log stream --predicate 'subsystem == "com.apple.sandbox"' --debug
 ```

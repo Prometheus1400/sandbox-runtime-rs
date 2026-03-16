@@ -65,6 +65,7 @@ impl SocatBridge {
     }
 
     /// Get the socket path.
+    #[allow(dead_code)]
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
     }
@@ -103,12 +104,17 @@ pub fn check_socat() -> bool {
         .unwrap_or(false)
 }
 
-/// Generate a unique socket path in /tmp.
+/// Generate a unique socket path in /var/tmp so it remains visible inside bubblewrap.
 pub fn generate_socket_path(prefix: &str) -> PathBuf {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let suffix: u32 = rng.gen();
-    PathBuf::from(format!("/tmp/{}-{}-{:08x}.sock", prefix, std::process::id(), suffix))
+    PathBuf::from(format!(
+        "/var/tmp/{}-{}-{:08x}.sock",
+        prefix,
+        std::process::id(),
+        suffix
+    ))
 }
 
 #[cfg(test)]
@@ -120,7 +126,7 @@ mod tests {
         let path1 = generate_socket_path("srt-http");
         let path2 = generate_socket_path("srt-http");
 
-        assert!(path1.to_string_lossy().starts_with("/tmp/srt-http-"));
+        assert!(path1.to_string_lossy().starts_with("/var/tmp/srt-http-"));
         assert!(path1.to_string_lossy().ends_with(".sock"));
         // Paths should be different due to random suffix
         assert_ne!(path1, path2);

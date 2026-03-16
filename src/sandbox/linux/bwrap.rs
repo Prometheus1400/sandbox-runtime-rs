@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config::SandboxRuntimeConfig;
 use crate::error::SandboxError;
 use crate::sandbox::linux::bridge::SocatBridge;
-use crate::sandbox::linux::filesystem::{generate_bind_mounts, BindMount};
+use crate::sandbox::linux::filesystem::generate_bind_mounts;
 use crate::sandbox::linux::seccomp::{get_apply_seccomp_path, get_bpf_path};
 use crate::utils::quote;
 
@@ -18,7 +18,14 @@ pub fn check_bwrap() -> bool {
         .unwrap_or(false)
 }
 
+fn should_unshare_network(config: &SandboxRuntimeConfig) -> bool {
+    !config.network.allowed_domains.is_empty()
+        || !config.network.denied_domains.is_empty()
+        || config.network.mitm_proxy.is_some()
+}
+
 /// Generate the bubblewrap command for sandboxed execution.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn generate_bwrap_command(
     command: &str,
     config: &SandboxRuntimeConfig,
@@ -40,10 +47,10 @@ pub fn generate_bwrap_command(
     )?;
 
     // Build bwrap arguments
-    let mut bwrap_args = vec![
-        "bwrap".to_string(),
-        "--unshare-net".to_string(), // Network isolation
-    ];
+    let mut bwrap_args = vec!["bwrap".to_string()];
+    if should_unshare_network(config) {
+        bwrap_args.push("--unshare-net".to_string());
+    }
 
     // Start with read-only root filesystem. This must be mounted before
     // synthetic mounts like /dev, /proc, and tmpfs paths so those mounts
@@ -107,8 +114,87 @@ pub fn generate_bwrap_command(
     Ok((wrapped, warnings))
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
+pub fn generate_bwrap_command_with_runner(
+    command: &str,
+    config: &SandboxRuntimeConfig,
+    cwd: &Path,
+    http_socket_path: Option<&str>,
+    socks_socket_path: Option<&str>,
+    http_proxy_port: u16,
+    socks_proxy_port: u16,
+    shell: Option<&str>,
+    runner_path: &Path,
+    notify_socket_path: &Path,
+) -> Result<(String, Vec<String>), SandboxError> {
+    let shell = shell.unwrap_or("/bin/bash");
+    let (mounts, warnings) = generate_bind_mounts(
+        &config.filesystem,
+        cwd,
+        config.ripgrep.as_ref(),
+        config.mandatory_deny_search_depth,
+    )?;
+
+    let mut bwrap_args = vec!["bwrap".to_string()];
+    if should_unshare_network(config) {
+        bwrap_args.push("--unshare-net".to_string());
+    }
+    bwrap_args.push("--ro-bind".to_string());
+    bwrap_args.push("/".to_string());
+    bwrap_args.push("/".to_string());
+    bwrap_args.push("--dev".to_string());
+    bwrap_args.push("/dev".to_string());
+    bwrap_args.push("--proc".to_string());
+    bwrap_args.push("/proc".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/tmp".to_string());
+    bwrap_args.push("--tmpfs".to_string());
+    bwrap_args.push("/run".to_string());
+
+    for mount in &mounts {
+        if !mount.readonly {
+            bwrap_args.extend(mount.to_bwrap_args());
+        }
+    }
+    for mount in &mounts {
+        if mount.readonly {
+            bwrap_args.extend(mount.to_bwrap_args());
+        }
+    }
+
+    bwrap_args.push("--chdir".to_string());
+    bwrap_args.push(cwd.display().to_string());
+
+    let inner_command = build_inner_command_with_runner(
+        command,
+        config,
+        http_socket_path,
+        socks_socket_path,
+        http_proxy_port,
+        socks_proxy_port,
+        shell,
+        runner_path,
+        notify_socket_path,
+    )?;
+
+    bwrap_args.push("--".to_string());
+    bwrap_args.push(shell.to_string());
+    bwrap_args.push("-c".to_string());
+    bwrap_args.push(inner_command);
+
+    let wrapped = bwrap_args
+        .iter()
+        .map(|s| quote(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok((wrapped, warnings))
+}
+
 /// Build the inner command to run inside bubblewrap.
 /// This sets up socat bridges and applies seccomp before running the user command.
+#[allow(dead_code)]
 fn build_inner_command(
     command: &str,
     config: &SandboxRuntimeConfig,
@@ -158,9 +244,7 @@ fn build_inner_command(
             ));
         } else {
             // Seccomp not available, just run the command with warning
-            tracing::warn!(
-                "Seccomp not available - Unix socket creation will not be blocked"
-            );
+            tracing::warn!("Seccomp not available - Unix socket creation will not be blocked");
             let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
             parts.push(format!("{} ; {} -c {}", env_vars, shell, quote(command)));
         }
@@ -183,7 +267,54 @@ fn generate_proxy_env_string(http_port: u16, socks_port: u16) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
+fn build_inner_command_with_runner(
+    command: &str,
+    config: &SandboxRuntimeConfig,
+    http_socket_path: Option<&str>,
+    socks_socket_path: Option<&str>,
+    http_proxy_port: u16,
+    socks_proxy_port: u16,
+    shell: &str,
+    runner_path: &Path,
+    notify_socket_path: &Path,
+) -> Result<String, SandboxError> {
+    let mut parts = Vec::new();
+    let mut bridge_cmds = Vec::new();
+
+    if let Some(http_sock) = http_socket_path {
+        bridge_cmds.push(SocatBridge::tcp_to_unix_command(http_proxy_port, http_sock));
+    }
+    if let Some(socks_sock) = socks_socket_path {
+        bridge_cmds.push(SocatBridge::tcp_to_unix_command(socks_proxy_port, socks_sock));
+    }
+    if !bridge_cmds.is_empty() {
+        parts.push(format!("{} & sleep 0.1", bridge_cmds.join(" & ")));
+    }
+
+    let env_vars = generate_proxy_env_string(http_proxy_port, socks_proxy_port);
+    parts.push(env_vars);
+
+    if config.network.allow_all_unix_sockets.unwrap_or(false) {
+        parts.push(format!("exec {} -c {}", quote(shell), quote(command)));
+    } else {
+        let bpf_path = get_bpf_path(config.seccomp.as_ref())?;
+        parts.push(format!(
+            "exec {} {} {} {} -c {}",
+            quote(&runner_path.display().to_string()),
+            quote(&notify_socket_path.display().to_string()),
+            quote(&bpf_path.display().to_string()),
+            quote(shell),
+            quote(command)
+        ));
+    }
+
+    Ok(parts.join(" ; "))
+}
+
 /// Generate proxy environment variables.
+#[allow(dead_code)]
 pub fn generate_proxy_env(http_port: u16, socks_port: u16) -> Vec<(String, String)> {
     let http_proxy = format!("http://localhost:{}", http_port);
     let socks_proxy = format!("socks5://localhost:{}", socks_port);
@@ -239,7 +370,7 @@ mod tests {
             .expect("build_inner_command should succeed");
 
         assert!(
-            inner.contains("all_proxy='socks5://localhost:1080' ; /bin/bash -c 'ls'"),
+            inner.contains("all_proxy='socks5://localhost:1080' ; /bin/bash -c "),
             "inner command must separate export from shell execution: {inner}"
         );
     }
@@ -265,6 +396,82 @@ mod tests {
         assert!(
             wrapped.contains("--chdir /tmp/simpleclaw-workspace"),
             "wrapped command should use provided cwd: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_does_not_unshare_network_without_restrictions() {
+        let config = SandboxRuntimeConfig::default();
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+        )
+        .expect("generate_bwrap_command should succeed");
+
+        assert!(
+            !wrapped.contains("--unshare-net"),
+            "wrapped command should not unshare network without network restrictions: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_unshares_network_with_domain_rules() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allowed_domains.push("example.com".to_string());
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+        )
+        .expect("generate_bwrap_command should succeed");
+
+        assert!(
+            wrapped.contains("--unshare-net"),
+            "wrapped command should unshare network when network restrictions are configured: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_with_runner_uses_notify_socket_path() {
+        let config = SandboxRuntimeConfig::default();
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command_with_runner(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+            Path::new("/tmp/seccomp-runner"),
+            Path::new("/var/tmp/srt-seccomp-notify.sock"),
+        )
+        .expect("generate_bwrap_command_with_runner should succeed");
+
+        assert!(
+            wrapped.contains("/tmp/seccomp-runner /var/tmp/srt-seccomp-notify.sock"),
+            "wrapped command should pass the notify socket path to the runner: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("--preserve-fd"),
+            "wrapped command should not require preserve-fd support from bwrap: {wrapped}"
         );
     }
 

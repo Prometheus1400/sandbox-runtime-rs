@@ -58,6 +58,10 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FilesystemConfig {
+    /// Paths explicitly allowed for reading.
+    #[serde(default)]
+    pub allow_read: Vec<String>,
+
     /// Paths/patterns denied for reading.
     #[serde(default)]
     pub deny_read: Vec<String>,
@@ -161,13 +165,8 @@ pub const DANGEROUS_FILES: &[&str] = &[
 ];
 
 /// Dangerous directories that should never be writable.
-pub const DANGEROUS_DIRECTORIES: &[&str] = &[
-    ".git/hooks",
-    ".git",
-    ".vscode",
-    ".idea",
-    ".claude/commands",
-];
+pub const DANGEROUS_DIRECTORIES: &[&str] =
+    &[".git/hooks", ".git", ".vscode", ".idea", ".claude/commands"];
 
 impl SandboxRuntimeConfig {
     /// Validate the configuration.
@@ -214,8 +213,7 @@ fn validate_domain_pattern(pattern: &str) -> Result<(), SandboxError> {
     }
 
     // Check for too broad patterns like *.com
-    if pattern.starts_with("*.") {
-        let suffix = &pattern[2..];
+    if let Some(suffix) = pattern.strip_prefix("*.") {
         // Check if suffix is a TLD or too short
         if !suffix.contains('.') && suffix.len() <= 4 {
             return Err(ConfigError::InvalidDomainPattern {
@@ -236,11 +234,7 @@ fn validate_domain_pattern(pattern: &str) -> Result<(), SandboxError> {
     }
 
     // Check for invalid characters
-    let check_part = if pattern.starts_with("*.") {
-        &pattern[2..]
-    } else {
-        pattern
-    };
+    let check_part = pattern.strip_prefix("*.").unwrap_or(pattern);
 
     for ch in check_part.chars() {
         if !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-' && ch != '_' {
@@ -260,9 +254,8 @@ pub fn matches_domain_pattern(hostname: &str, pattern: &str) -> bool {
     let hostname_lower = hostname.to_lowercase();
     let pattern_lower = pattern.to_lowercase();
 
-    if pattern_lower.starts_with("*.") {
+    if let Some(base_domain) = pattern_lower.strip_prefix("*.") {
         // Wildcard pattern: *.example.com matches api.example.com but NOT example.com
-        let base_domain = &pattern_lower[2..];
         hostname_lower.ends_with(&format!(".{}", base_domain))
     } else {
         // Exact match
@@ -283,7 +276,10 @@ mod tests {
 
         // Wildcard match
         assert!(matches_domain_pattern("api.example.com", "*.example.com"));
-        assert!(matches_domain_pattern("deep.api.example.com", "*.example.com"));
+        assert!(matches_domain_pattern(
+            "deep.api.example.com",
+            "*.example.com"
+        ));
         assert!(!matches_domain_pattern("example.com", "*.example.com"));
 
         // Case insensitivity
