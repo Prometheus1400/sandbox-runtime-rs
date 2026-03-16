@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static int send_fd(int socket_fd, int fd_to_send) {
@@ -38,6 +39,34 @@ static int send_fd(int socket_fd, int fd_to_send) {
     memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
 
     return sendmsg(socket_fd, &msg, 0);
+}
+
+static int connect_notify_socket(const char *socket_path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    size_t path_len = strlen(socket_path);
+    if (path_len >= sizeof(addr.sun_path)) {
+        close(fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(addr.sun_path, socket_path, path_len + 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+
+    return fd;
 }
 
 static struct sock_filter *load_filter(const char *path, unsigned short *out_len) {
@@ -85,11 +114,15 @@ static struct sock_filter *load_filter(const char *path, unsigned short *out_len
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <notify-socket-fd> <bpf-path> <program> [args...]\n", argv[0]);
+        fprintf(stderr, "usage: %s <notify-socket-path> <bpf-path> <program> [args...]\n", argv[0]);
         return 64;
     }
 
-    int notify_socket_fd = atoi(argv[1]);
+    int notify_socket_fd = connect_notify_socket(argv[1]);
+    if (notify_socket_fd < 0) {
+        perror("connect(notify_socket)");
+        return 70;
+    }
     const char *bpf_path = argv[2];
 
     unsigned short filter_len = 0;

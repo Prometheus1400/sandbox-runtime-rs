@@ -120,7 +120,7 @@ pub fn generate_bwrap_command_with_runner(
     socks_proxy_port: u16,
     shell: Option<&str>,
     runner_path: &Path,
-    notify_fd: i32,
+    notify_socket_path: &Path,
 ) -> Result<(String, Vec<String>), SandboxError> {
     let shell = shell.unwrap_or("/bin/bash");
     let (mounts, warnings) = generate_bind_mounts(
@@ -131,10 +131,6 @@ pub fn generate_bwrap_command_with_runner(
     )?;
 
     let mut bwrap_args = vec!["bwrap".to_string(), "--unshare-net".to_string()];
-    // Keep the notification socket fd open so the seccomp runner can send the
-    // listener fd back to the parent from inside the sandbox.
-    bwrap_args.push("--preserve-fd".to_string());
-    bwrap_args.push(notify_fd.to_string());
     bwrap_args.push("--ro-bind".to_string());
     bwrap_args.push("/".to_string());
     bwrap_args.push("/".to_string());
@@ -170,7 +166,7 @@ pub fn generate_bwrap_command_with_runner(
         socks_proxy_port,
         shell,
         runner_path,
-        notify_fd,
+        notify_socket_path,
     )?;
 
     bwrap_args.push("--".to_string());
@@ -273,7 +269,7 @@ fn build_inner_command_with_runner(
     socks_proxy_port: u16,
     shell: &str,
     runner_path: &Path,
-    notify_fd: i32,
+    notify_socket_path: &Path,
 ) -> Result<String, SandboxError> {
     let mut parts = Vec::new();
     let mut bridge_cmds = Vec::new();
@@ -298,7 +294,7 @@ fn build_inner_command_with_runner(
         parts.push(format!(
             "exec {} {} {} {} -c {}",
             quote(&runner_path.display().to_string()),
-            notify_fd,
+            quote(&notify_socket_path.display().to_string()),
             quote(&bpf_path.display().to_string()),
             quote(shell),
             quote(command)
@@ -395,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_bwrap_command_with_runner_preserves_notify_fd() {
+    fn test_generate_bwrap_command_with_runner_uses_notify_socket_path() {
         let config = SandboxRuntimeConfig::default();
         let cwd = Path::new("/tmp/simpleclaw-workspace");
 
@@ -409,17 +405,17 @@ mod tests {
             1080,
             Some("/bin/bash"),
             Path::new("/tmp/seccomp-runner"),
-            42,
+            Path::new("/var/tmp/srt-seccomp-notify.sock"),
         )
         .expect("generate_bwrap_command_with_runner should succeed");
 
         assert!(
-            wrapped.contains("--preserve-fd 42"),
-            "wrapped command should preserve the notify fd for the runner: {wrapped}"
+            wrapped.contains("/tmp/seccomp-runner /var/tmp/srt-seccomp-notify.sock"),
+            "wrapped command should pass the notify socket path to the runner: {wrapped}"
         );
         assert!(
-            !wrapped.contains("--sync-fd 42"),
-            "wrapped command should not use sync-fd for the runner notify socket: {wrapped}"
+            !wrapped.contains("--preserve-fd"),
+            "wrapped command should not require preserve-fd support from bwrap: {wrapped}"
         );
     }
 

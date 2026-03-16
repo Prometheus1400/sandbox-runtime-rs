@@ -336,28 +336,23 @@ impl SandboxedCommand {
         violations_tx: mpsc::Sender<SandboxViolationEvent>,
         violations_rx: mpsc::Receiver<SandboxViolationEvent>,
     ) -> Result<SandboxedChild, SandboxError> {
-        use std::os::unix::io::AsRawFd;
-
         let http_socket_path = generate_socket_path("srt-http");
         let socks_socket_path = generate_socket_path("srt-socks");
+        let notify_socket_path = generate_socket_path("srt-seccomp-notify");
         let http_bridge =
             SocatBridge::unix_to_tcp(http_socket_path.clone(), "127.0.0.1", http_port).await?;
         let socks_bridge =
             SocatBridge::unix_to_tcp(socks_socket_path.clone(), "127.0.0.1", socks_port).await?;
-
-        // Create Unix socketpair for seccomp notification fd passing
-        let (parent_sock, child_sock) =
-            std::os::unix::net::UnixStream::pair().map_err(SandboxError::Io)?;
-
-        // Set receive timeout on parent socket so we don't block forever
-        parent_sock
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        let notify_listener = std::os::unix::net::UnixListener::bind(&notify_socket_path)
             .map_err(SandboxError::Io)?;
+        notify_listener
+            .set_nonblocking(true)
+            .map_err(SandboxError::Io)?;
+        let notify_listener =
+            tokio::net::UnixListener::from_std(notify_listener).map_err(SandboxError::Io)?;
 
         // Extract the embedded seccomp-runner binary
         let runner_path = extract_seccomp_runner()?;
-
-        let child_fd = child_sock.as_raw_fd();
 
         // Generate bwrap command using the runner variant
         let (wrapped, warnings) = generate_bwrap_command_with_runner(
@@ -370,14 +365,14 @@ impl SandboxedCommand {
             socks_port,
             None,
             &runner_path,
-            child_fd,
+            &notify_socket_path,
         )?;
         for warning in warnings {
             tracing::warn!("{warning}");
         }
         tracing::debug!(
             runner_path = %runner_path.display(),
-            notify_fd = child_fd,
+            notify_socket_path = %notify_socket_path.display(),
             wrapped_command = %wrapped,
             "starting linux sandbox via seccomp runner"
         );
@@ -386,42 +381,27 @@ impl SandboxedCommand {
         inner.arg("-c").arg(&wrapped);
         self.apply_outer_builder(&mut inner, &cwd);
 
-        // Clear close-on-exec on child_fd so it survives into the child process
-        unsafe {
-            inner.pre_exec(move || {
-                let flags = libc::fcntl(child_fd, libc::F_GETFD);
-                if flags < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
         let mut child = inner.spawn()?;
-        drop(child_sock); // Close child end in parent
 
         // Receive the seccomp listener fd from the runner via SCM_RIGHTS
         tracing::debug!("waiting for seccomp listener fd from runner");
-        let listener_fd = match recv_fd(&parent_sock) {
+        let listener_fd = match wait_for_seccomp_listener_fd(&notify_listener).await {
             Ok(fd) => fd,
             Err(recv_error) => {
-                drop(parent_sock);
                 let error = collect_seccomp_startup_error(
                     &mut child,
                     recv_error,
                     &wrapped,
                     &runner_path,
-                    child_fd,
+                    &notify_socket_path,
                 )
                 .await;
+                let _ = std::fs::remove_file(&notify_socket_path);
                 let _ = std::fs::remove_file(&runner_path);
                 return Err(error);
             }
         };
-        drop(parent_sock);
+        let _ = std::fs::remove_file(&notify_socket_path);
         tracing::debug!("received seccomp listener fd from runner");
 
         // Clean up runner binary — the child has already exec'd it
@@ -462,8 +442,8 @@ impl SandboxedCommand {
 /// Receive a file descriptor over a Unix socket via SCM_RIGHTS.
 /// Counterpart to the `send_fd()` in runner.c.
 #[cfg(target_os = "linux")]
-fn recv_fd(
-    sock: &std::os::unix::net::UnixStream,
+fn recv_fd<Fd: std::os::fd::AsRawFd>(
+    sock: &Fd,
 ) -> Result<std::os::fd::OwnedFd, SeccompFdReceiveError> {
     use nix::cmsg_space;
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
@@ -512,6 +492,34 @@ fn recv_fd(
 }
 
 #[cfg(target_os = "linux")]
+async fn wait_for_seccomp_listener_fd(
+    listener: &tokio::net::UnixListener,
+) -> Result<std::os::fd::OwnedFd, SeccompFdReceiveError> {
+    let stream = match tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
+    {
+        Ok(Ok((stream, _addr))) => stream,
+        Ok(Err(err)) => {
+            return Err(SeccompFdReceiveError {
+                summary: format!("failed to accept seccomp runner connection: {err}"),
+                bytes: None,
+                flags: None,
+                ancillary: None,
+            });
+        }
+        Err(_) => {
+            return Err(SeccompFdReceiveError {
+                summary: "timed out waiting for seccomp runner connection".into(),
+                bytes: None,
+                flags: None,
+                ancillary: None,
+            });
+        }
+    };
+
+    recv_fd(&stream)
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct SeccompFdReceiveError {
     summary: String,
@@ -526,7 +534,7 @@ async fn collect_seccomp_startup_error(
     recv_error: SeccompFdReceiveError,
     wrapped_command: &str,
     runner_path: &Path,
-    notify_fd: i32,
+    notify_socket_path: &Path,
 ) -> SandboxError {
     use tokio::io::AsyncReadExt;
 
@@ -593,7 +601,7 @@ async fn collect_seccomp_startup_error(
         stdout.as_deref(),
         wrapped_command,
         &runner_path.display().to_string(),
-        notify_fd,
+        &notify_socket_path.display().to_string(),
     );
     tracing::warn!("{message}");
     SandboxError::Seccomp(message)
@@ -607,7 +615,7 @@ fn format_seccomp_startup_error(
     stdout: Option<&[u8]>,
     wrapped_command: &str,
     runner_path: &str,
-    notify_fd: i32,
+    notify_socket_path: &str,
 ) -> String {
     let mut parts = vec![format!("seccomp runner startup failed: {}", recv_error.summary)];
 
@@ -632,7 +640,7 @@ fn format_seccomp_startup_error(
         parts.push(format!("stdout={stdout}"));
     }
     parts.push(format!("runner_path={runner_path}"));
-    parts.push(format!("notify_fd={notify_fd}"));
+    parts.push(format!("notify_socket_path={notify_socket_path}"));
     parts.push(format!(
         "command={}",
         summarize_text(wrapped_command, SECCOMP_DIAGNOSTIC_SNIPPET_LIMIT)
@@ -720,9 +728,9 @@ mod tests {
             Some("exit status: 67"),
             Some(b"seccomp(SECCOMP_SET_MODE_FILTER): Invalid argument\n"),
             Some(b""),
-            "bwrap --preserve-fd 42 -- sh -c 'runner'",
+            "bwrap -- sh -c 'runner /var/tmp/srt-seccomp-notify.sock'",
             "/tmp/seccomp-runner",
-            42,
+            "/var/tmp/srt-seccomp-notify.sock",
         );
 
         assert!(message.contains("no listener fd received from seccomp runner"));
@@ -730,7 +738,7 @@ mod tests {
         assert!(message.contains("child_status=exit status: 67"));
         assert!(message.contains("stderr=seccomp(SECCOMP_SET_MODE_FILTER): Invalid argument"));
         assert!(message.contains("runner_path=/tmp/seccomp-runner"));
-        assert!(message.contains("notify_fd=42"));
-        assert!(message.contains("command=bwrap --preserve-fd 42"));
+        assert!(message.contains("notify_socket_path=/var/tmp/srt-seccomp-notify.sock"));
+        assert!(message.contains("command=bwrap -- sh -c 'runner /var/tmp/srt-seccomp-notify.sock'"));
     }
 }
