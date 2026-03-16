@@ -279,13 +279,13 @@ async fn test_successful_process_no_false_violations() {
 #[tokio::test]
 #[ignore]
 async fn test_linux_write_violation_reports_execution_violation() {
-    // Write directly to /tmp/forbidden.txt rather than a tempdir subdirectory.
-    // bwrap mounts a fresh tmpfs on /tmp, so host tempdirs don't exist inside
-    // the sandbox. /tmp itself exists and seccomp will intercept the write
-    // syscall before it completes since no allow_write is configured.
+    // Write to a path under the read-only root bind (--ro-bind / /), NOT under
+    // /tmp or /run which are writable tmpfs mounts. /var/tmp exists on the host
+    // and is visible inside bwrap as read-only, so the write will fail with
+    // EROFS ("Read-only file system") at the filesystem level.
     let result = SandboxedCommand::new("sh")
         .arg("-c")
-        .arg("echo denied > /tmp/forbidden.txt")
+        .arg("echo denied > /var/tmp/forbidden.txt")
         .allow_read("/")
         .output()
         .await;
