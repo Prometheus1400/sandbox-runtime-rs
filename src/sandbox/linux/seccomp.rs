@@ -21,6 +21,7 @@ const SECCOMP_BPF_FILTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unix
 static BPF_PATH_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+#[allow(dead_code)]
 /// Cache for apply-seccomp binary path lookups
 static APPLY_SECCOMP_PATH_CACHE: Lazy<Mutex<std::collections::HashMap<String, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -122,6 +123,7 @@ fn find_bpf_path(explicit_path: Option<&str>) -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)]
 /// Find the apply-seccomp binary path without caching (internal implementation).
 fn find_apply_seccomp_path(explicit_path: Option<&str>) -> Option<PathBuf> {
     // Check explicit path first (highest priority)
@@ -202,6 +204,7 @@ pub fn get_bpf_path(config: Option<&SeccompConfig>) -> Result<PathBuf, SandboxEr
     })
 }
 
+#[allow(dead_code)]
 /// Get the path to the apply-seccomp binary for the current architecture.
 /// Results are cached for performance.
 pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf, SandboxError> {
@@ -240,6 +243,7 @@ pub fn get_apply_seccomp_path(config: Option<&SeccompConfig>) -> Result<PathBuf,
     })
 }
 
+#[allow(dead_code)]
 /// Check if seccomp is available on the current system.
 pub fn is_seccomp_available(config: Option<&SeccompConfig>) -> bool {
     get_bpf_path(config).is_ok() && get_apply_seccomp_path(config).is_ok()

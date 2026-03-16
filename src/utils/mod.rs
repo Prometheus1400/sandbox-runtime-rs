@@ -8,7 +8,7 @@ pub mod shell;
 
 pub use path::{contains_glob_chars, normalize_path_for_sandbox};
 #[cfg(target_os = "linux")]
-pub use path::{is_symlink_outside_boundary, normalize_path_components, remove_trailing_glob_suffix};
+pub use path::{is_symlink_outside_boundary, normalize_path_components};
 pub use platform::{current_platform, Platform};
 #[cfg(target_os = "linux")]
 pub use platform::get_arch;

@@ -65,6 +65,7 @@ impl SocatBridge {
     }
 
     /// Get the socket path.
+    #[allow(dead_code)]
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
     }

@@ -324,7 +324,7 @@ fn read_process_memory(pid: u32, remote_addr: u64, len: usize) -> Option<Vec<u8>
         iov_len: len,
     };
 
-    let read = unsafe { libc::process_vm_readv(pid as i32, &mut local, 1, &remote, 1, 0) };
+    let read = unsafe { libc::process_vm_readv(pid as i32, &local, 1, &remote, 1, 0) };
     if read <= 0 {
         return None;
     }

@@ -21,6 +21,7 @@ pub(crate) fn proxy_network_denied_event(
         )
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn macos_log_event(
     line: String,
     command: Option<String>,
@@ -88,6 +89,7 @@ pub(crate) fn linux_seccomp_event(
     )
 }
 
+#[cfg(target_os = "macos")]
 fn parse_macos_violation(
     line: &str,
 ) -> Option<(SandboxViolationKind, String, Option<String>)> {

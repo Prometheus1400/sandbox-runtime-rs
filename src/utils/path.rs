@@ -59,6 +59,7 @@ pub fn normalize_path_components(path: &Path) -> PathBuf {
 /// For example, `/foo/bar/**` becomes `/foo/bar` and `/foo/*/baz` becomes `/foo`.
 /// Used to extract the base directory from a glob pattern for bind-mounting.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn remove_trailing_glob_suffix(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     let mut base_parts = Vec::new();

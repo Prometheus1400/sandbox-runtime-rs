@@ -81,6 +81,7 @@ pub fn find_dangerous_files(
     Ok(files)
 }
 
+#[allow(dead_code)]
 /// Check if ripgrep is available.
 pub fn check_ripgrep(config: Option<&RipgrepConfig>) -> bool {
     let command = config.map(|c| c.command.as_str()).unwrap_or("rg");

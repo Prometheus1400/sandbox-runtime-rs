@@ -19,6 +19,7 @@ pub fn check_bwrap() -> bool {
 }
 
 /// Generate the bubblewrap command for sandboxed execution.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn generate_bwrap_command(
     command: &str,
     config: &SandboxRuntimeConfig,
@@ -107,6 +108,7 @@ pub fn generate_bwrap_command(
     Ok((wrapped, warnings))
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
 pub fn generate_bwrap_command_with_runner(
     command: &str,
@@ -183,6 +185,7 @@ pub fn generate_bwrap_command_with_runner(
 
 /// Build the inner command to run inside bubblewrap.
 /// This sets up socat bridges and applies seccomp before running the user command.
+#[allow(dead_code)]
 fn build_inner_command(
     command: &str,
     config: &SandboxRuntimeConfig,
@@ -255,6 +258,7 @@ fn generate_proxy_env_string(http_port: u16, socks_port: u16) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
 fn build_inner_command_with_runner(
     command: &str,
@@ -301,6 +305,7 @@ fn build_inner_command_with_runner(
 }
 
 /// Generate proxy environment variables.
+#[allow(dead_code)]
 pub fn generate_proxy_env(http_port: u16, socks_port: u16) -> Vec<(String, String)> {
     let http_proxy = format!("http://localhost:{}", http_port);
     let socks_proxy = format!("socks5://localhost:{}", socks_port);
