@@ -2,8 +2,10 @@ use std::process::Stdio;
 
 use sandbox_runtime::command::SandboxedCommand;
 use sandbox_runtime::config::SandboxRuntimeConfig;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use sandbox_runtime::error::SandboxError;
+#[cfg(target_os = "linux")]
+use sandbox_runtime::error::SandboxViolationKind;
 
 #[tokio::test]
 async fn test_sandboxed_command_builder() {
@@ -32,6 +34,9 @@ async fn test_sandboxed_command_full_builder() {
 
 // The following tests spawn real sandbox-exec processes on macOS. They must
 // be run sequentially (--test-threads=1) to avoid proxy port conflicts:
+//   cargo test --test declarative_api_test -- --ignored --test-threads=1
+//
+// Linux ignored tests require `bwrap` and `socat` to be installed:
 //   cargo test --test declarative_api_test -- --ignored --test-threads=1
 
 #[cfg(target_os = "macos")]
@@ -268,4 +273,67 @@ async fn test_successful_process_no_false_violations() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "hello");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn test_linux_write_violation_reports_execution_violation() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let canonical_dir = dir.path().canonicalize().expect("canonicalize tempdir");
+    let file_path = canonical_dir.join("forbidden.txt");
+
+    let result = SandboxedCommand::new("sh")
+        .arg("-c")
+        .arg(format!("echo denied > {}", file_path.display()))
+        .allow_read("/")
+        .output()
+        .await;
+
+    match result {
+        Err(SandboxError::ExecutionViolation(err)) => {
+            assert!(
+                err.violations
+                    .iter()
+                    .any(|v| v.kind == SandboxViolationKind::FilesystemWrite),
+                "expected filesystem write violation, got: {:?}",
+                err.violations
+            );
+        }
+        other => {
+            panic!("expected ExecutionViolation, got: {other:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn test_linux_unix_socket_violation_reports_execution_violation() {
+    let result = SandboxedCommand::new("python3")
+        .arg("-c")
+        .arg(
+            "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); print('unexpected')",
+        )
+        .allow_read("/")
+        .output()
+        .await;
+
+    match result {
+        Err(SandboxError::ExecutionViolation(err)) => {
+            assert!(
+                err.violations
+                    .iter()
+                    .any(|v| v.kind == SandboxViolationKind::UnixSocket),
+                "expected UnixSocket violation, got: {:?}",
+                err.violations
+            );
+        }
+        Err(SandboxError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("python3 not installed; skipping assertion");
+        }
+        other => {
+            panic!("expected ExecutionViolation, got: {other:?}");
+        }
+    }
 }
