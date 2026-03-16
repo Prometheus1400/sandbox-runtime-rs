@@ -447,7 +447,7 @@ fn recv_fd<Fd: std::os::fd::AsRawFd>(
 ) -> Result<std::os::fd::OwnedFd, SeccompFdReceiveError> {
     use nix::cmsg_space;
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     let mut buf = [0u8; 1];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
