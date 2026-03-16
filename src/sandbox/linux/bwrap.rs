@@ -133,7 +133,7 @@ pub fn generate_bwrap_command_with_runner(
     let mut bwrap_args = vec!["bwrap".to_string(), "--unshare-net".to_string()];
     // Keep the notification socket fd open so the seccomp runner can send the
     // listener fd back to the parent from inside the sandbox.
-    bwrap_args.push("--sync-fd".to_string());
+    bwrap_args.push("--preserve-fd".to_string());
     bwrap_args.push(notify_fd.to_string());
     bwrap_args.push("--ro-bind".to_string());
     bwrap_args.push("/".to_string());
@@ -391,6 +391,35 @@ mod tests {
         assert!(
             wrapped.contains("--chdir /tmp/simpleclaw-workspace"),
             "wrapped command should use provided cwd: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_with_runner_preserves_notify_fd() {
+        let config = SandboxRuntimeConfig::default();
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command_with_runner(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+            Path::new("/tmp/seccomp-runner"),
+            42,
+        )
+        .expect("generate_bwrap_command_with_runner should succeed");
+
+        assert!(
+            wrapped.contains("--preserve-fd 42"),
+            "wrapped command should preserve the notify fd for the runner: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("--sync-fd 42"),
+            "wrapped command should not use sync-fd for the runner notify socket: {wrapped}"
         );
     }
 
