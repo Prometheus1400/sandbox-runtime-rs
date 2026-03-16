@@ -207,8 +207,10 @@ fn evaluate_request(
     }
 
     match syscall {
-        "openat" => match openat_write_target(req.pid, req.data.args) {
-            Some(path) if !write_policy.allows(&path) => RequestDecision::Deny(
+        "openat" => match openat_write_check(req.pid, req.data.args) {
+            OpenatCheck::NotWrite => RequestDecision::Continue,
+            OpenatCheck::WriteTo(path) if write_policy.allows(&path) => RequestDecision::Continue,
+            OpenatCheck::WriteTo(path) => RequestDecision::Deny(
                 linux_filesystem_write_event(
                     req.pid,
                     "openat",
@@ -216,10 +218,19 @@ fn evaluate_request(
                     command,
                 ),
             ),
-            Some(_) | None => RequestDecision::Continue,
+            OpenatCheck::WriteUnresolved => RequestDecision::Deny(
+                linux_filesystem_write_event(
+                    req.pid,
+                    "openat",
+                    "<unresolved>".to_string(),
+                    command,
+                ),
+            ),
         },
-        "openat2" => match openat2_write_target(req.pid, req.data.args) {
-            Some(path) if !write_policy.allows(&path) => RequestDecision::Deny(
+        "openat2" => match openat2_write_check(req.pid, req.data.args) {
+            OpenatCheck::NotWrite => RequestDecision::Continue,
+            OpenatCheck::WriteTo(path) if write_policy.allows(&path) => RequestDecision::Continue,
+            OpenatCheck::WriteTo(path) => RequestDecision::Deny(
                 linux_filesystem_write_event(
                     req.pid,
                     "openat2",
@@ -227,30 +238,57 @@ fn evaluate_request(
                     command,
                 ),
             ),
-            Some(_) | None => RequestDecision::Continue,
+            OpenatCheck::WriteUnresolved => RequestDecision::Deny(
+                linux_filesystem_write_event(
+                    req.pid,
+                    "openat2",
+                    "<unresolved>".to_string(),
+                    command,
+                ),
+            ),
         },
         _ => RequestDecision::Continue,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn openat_write_target(pid: u32, args: [u64; 6]) -> Option<PathBuf> {
-    let flags = args[2];
-    if !is_write_open_flags(flags) {
-        return None;
-    }
-
-    resolve_path_arg(pid, args[0] as i64, args[1])
+enum OpenatCheck {
+    /// The open flags don't indicate a write operation.
+    NotWrite,
+    /// Write operation with a resolved target path.
+    WriteTo(PathBuf),
+    /// Write operation but the target path could not be resolved
+    /// (e.g. process_vm_readv failed across namespaces).
+    WriteUnresolved,
 }
 
 #[cfg(target_os = "linux")]
-fn openat2_write_target(pid: u32, args: [u64; 6]) -> Option<PathBuf> {
-    let how = read_open_how(pid, args[2])?;
-    if !is_write_open_flags(how.flags) {
-        return None;
+fn openat_write_check(pid: u32, args: [u64; 6]) -> OpenatCheck {
+    let flags = args[2];
+    if !is_write_open_flags(flags) {
+        return OpenatCheck::NotWrite;
     }
 
-    resolve_path_arg(pid, args[0] as i64, args[1])
+    match resolve_path_arg(pid, args[0] as i64, args[1]) {
+        Some(path) => OpenatCheck::WriteTo(path),
+        None => OpenatCheck::WriteUnresolved,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn openat2_write_check(pid: u32, args: [u64; 6]) -> OpenatCheck {
+    let how = match read_open_how(pid, args[2]) {
+        Some(how) => how,
+        None => return OpenatCheck::WriteUnresolved,
+    };
+    if !is_write_open_flags(how.flags) {
+        return OpenatCheck::NotWrite;
+    }
+
+    match resolve_path_arg(pid, args[0] as i64, args[1]) {
+        Some(path) => OpenatCheck::WriteTo(path),
+        None => OpenatCheck::WriteUnresolved,
+    }
 }
 
 #[cfg(target_os = "linux")]

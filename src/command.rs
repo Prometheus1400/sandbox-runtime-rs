@@ -676,6 +676,7 @@ fn summarize_text(text: &str, max_len: usize) -> String {
 const STDERR_VIOLATION_PATTERNS: &[&str] = &[
     "Operation not permitted",
     "Permission denied",
+    "Read-only file system",
     "sandbox-exec: denied",
 ];
 
@@ -688,11 +689,7 @@ fn detect_stderr_violations(stderr: &str) -> Vec<SandboxViolationEvent> {
             .iter()
             .any(|pattern| line.contains(pattern))
         {
-            let kind = if line.contains("write") || line.contains("create") {
-                SandboxViolationKind::FilesystemWrite
-            } else {
-                SandboxViolationKind::Unknown
-            };
+            let kind = classify_stderr_violation(line);
             violations.push(
                 SandboxViolationEvent::new(format!("stderr: {}", line)).with_details(
                     kind,
@@ -703,6 +700,21 @@ fn detect_stderr_violations(stderr: &str) -> Vec<SandboxViolationEvent> {
         }
     }
     violations
+}
+
+/// Classify a stderr violation line into a specific violation kind.
+fn classify_stderr_violation(line: &str) -> SandboxViolationKind {
+    let lower = line.to_lowercase();
+    if lower.contains("write")
+        || lower.contains("create")
+        || lower.contains("read-only file system")
+    {
+        SandboxViolationKind::FilesystemWrite
+    } else if lower.contains("socket") || lower.contains("af_unix") {
+        SandboxViolationKind::UnixSocket
+    } else {
+        SandboxViolationKind::Unknown
+    }
 }
 
 #[cfg(test)]
