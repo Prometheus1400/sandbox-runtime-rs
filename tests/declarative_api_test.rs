@@ -2,6 +2,7 @@ use std::process::Stdio;
 
 use sandbox_runtime::command::SandboxedCommand;
 use sandbox_runtime::config::SandboxRuntimeConfig;
+#[cfg(target_os = "macos")]
 use sandbox_runtime::error::SandboxError;
 
 #[tokio::test]
