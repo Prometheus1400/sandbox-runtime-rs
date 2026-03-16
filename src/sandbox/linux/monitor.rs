@@ -315,7 +315,7 @@ fn read_process_c_string(pid: u32, ptr: u64) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn read_process_memory(pid: u32, remote_addr: u64, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    let mut local = libc::iovec {
+    let local = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: len,
     };

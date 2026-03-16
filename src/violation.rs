@@ -190,6 +190,7 @@ mod tests {
         assert_eq!(event.resource.as_deref(), Some("example.com:443"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_parse_macos_write_violation() {
         let event = macos_log_event(
