@@ -38,6 +38,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Allow unprivileged user namespaces (needed by bubblewrap)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Integration tests
         run: cargo test -- --ignored --test-threads=1
 
