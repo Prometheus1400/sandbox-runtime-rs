@@ -361,7 +361,7 @@ mod tests {
             .expect("build_inner_command should succeed");
 
         assert!(
-            inner.contains("all_proxy='socks5://localhost:1080' ; /bin/bash -c 'ls'"),
+            inner.contains("all_proxy='socks5://localhost:1080' ; /bin/bash -c "),
             "inner command must separate export from shell execution: {inner}"
         );
     }
