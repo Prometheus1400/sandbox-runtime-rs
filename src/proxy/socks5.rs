@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{SandboxError, SandboxViolationEvent};
 use crate::proxy::filter::{DomainFilter, FilterDecision};
+use crate::violation::proxy_network_denied_event;
 
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -208,10 +209,10 @@ async fn handle_client(
     if matches!(decision, FilterDecision::Deny) {
         tracing::debug!("SOCKS5 denied connection to {}:{}", host, port);
         let _ = violations_tx
-            .send(SandboxViolationEvent::new(format!(
-                "proxy: denied connection to {}:{}",
-                host, port
-            )))
+            .send(proxy_network_denied_event(
+                "connect",
+                format!("{}:{}", host, port),
+            ))
             .await;
         send_reply(&mut stream, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0).await?;
         return Ok(());

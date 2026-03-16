@@ -1,5 +1,8 @@
 //! Path normalization utilities.
 
+#[cfg(any(test, target_os = "linux"))]
+use std::path::{Component, Path, PathBuf};
+
 /// Normalize a path for sandbox use.
 /// - Expands ~ to home directory
 /// - Resolves to canonical path if possible
@@ -31,6 +34,24 @@ pub fn expand_home(path: &str) -> String {
 /// Check if a path contains glob characters.
 pub fn contains_glob_chars(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
+}
+
+/// Normalize path components lexically without touching the filesystem.
+#[cfg(any(test, target_os = "linux"))]
+pub fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 /// Strip trailing glob components from a path.
@@ -93,5 +114,11 @@ mod tests {
         assert!(contains_glob_chars("file[0-9].txt"));
         assert!(contains_glob_chars("file{a,b}.txt"));
         assert!(!contains_glob_chars("/plain/path"));
+    }
+
+    #[test]
+    fn test_normalize_path_components() {
+        let path = Path::new("/tmp/../var/./log");
+        assert_eq!(normalize_path_components(path), PathBuf::from("/var/log"));
     }
 }

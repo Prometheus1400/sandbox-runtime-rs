@@ -2,10 +2,31 @@
 
 use thiserror::Error;
 
+/// A normalized sandbox violation category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxViolationKind {
+    /// A filesystem read operation was denied by sandbox policy.
+    FilesystemRead,
+    /// A filesystem write or mutation operation was denied by sandbox policy.
+    FilesystemWrite,
+    /// A network request was denied by policy.
+    NetworkDomain,
+    /// Unix socket usage was denied by policy.
+    UnixSocket,
+    /// A sandbox violation occurred, but the runtime could not classify it further.
+    Unknown,
+}
+
 /// A sandbox violation event.
 #[derive(Debug, Clone)]
 pub struct SandboxViolationEvent {
-    /// The full violation line from the log.
+    /// The normalized violation category.
+    pub kind: SandboxViolationKind,
+    /// Human-readable operation name if known.
+    pub operation: Option<String>,
+    /// Target resource if known (path, host:port, etc.).
+    pub resource: Option<String>,
+    /// The full violation line from the runtime signal.
     pub line: String,
     /// The original command that triggered the violation.
     pub command: Option<String>,
@@ -19,6 +40,9 @@ impl SandboxViolationEvent {
     /// Create a new violation event.
     pub fn new(line: String) -> Self {
         Self {
+            kind: SandboxViolationKind::Unknown,
+            operation: None,
+            resource: None,
             line,
             command: None,
             encoded_command: None,
@@ -29,11 +53,27 @@ impl SandboxViolationEvent {
     /// Create a new violation event with command info.
     pub fn with_command(line: String, command: Option<String>, encoded: Option<String>) -> Self {
         Self {
+            kind: SandboxViolationKind::Unknown,
+            operation: None,
+            resource: None,
             line,
             command,
             encoded_command: encoded,
             timestamp: std::time::SystemTime::now(),
         }
+    }
+
+    /// Attach normalized violation metadata.
+    pub fn with_details(
+        mut self,
+        kind: SandboxViolationKind,
+        operation: impl Into<Option<String>>,
+        resource: impl Into<Option<String>>,
+    ) -> Self {
+        self.kind = kind;
+        self.operation = operation.into();
+        self.resource = resource.into();
+        self
     }
 }
 

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{SandboxError, SandboxViolationEvent};
+use crate::violation::macos_log_event;
 
 /// Log monitor for sandbox violations.
 #[allow(dead_code)]
@@ -54,7 +55,7 @@ impl LogMonitor {
                         continue;
                     }
                     if line.contains(&log_tag_clone) {
-                        let event = SandboxViolationEvent::with_command(
+                        let event = macos_log_event(
                             line,
                             command_clone.clone(),
                             Some(log_tag_clone.clone()),
@@ -100,7 +101,7 @@ impl Drop for LogMonitor {
 #[cfg(test)]
 fn parse_violation(line: &str, log_tag: &str) -> Option<SandboxViolationEvent> {
     if line.contains(log_tag) {
-        Some(SandboxViolationEvent::with_command(
+        Some(macos_log_event(
             line.to_string(),
             None,
             Some(log_tag.to_string()),

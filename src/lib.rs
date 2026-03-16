@@ -32,6 +32,7 @@ pub(crate) mod manager;
 pub(crate) mod proxy;
 pub(crate) mod sandbox;
 pub(crate) mod utils;
+pub(crate) mod violation;
 
 pub use child::SandboxedChild;
 pub use command::{SandboxedCommand, SandboxedOutput};
@@ -39,12 +40,12 @@ pub use config::{
     FilesystemConfig, MitmProxyConfig, NetworkConfig, RipgrepConfig, SandboxRuntimeConfig,
     SeccompConfig,
 };
-pub use error::{ConfigError, Result, SandboxError, SandboxViolationEvent};
+pub use error::{ConfigError, Result, SandboxError, SandboxViolationEvent, SandboxViolationKind};
 
 /// Re-export commonly used items.
 pub mod prelude {
     pub use crate::child::SandboxedChild;
     pub use crate::command::{SandboxedCommand, SandboxedOutput};
     pub use crate::config::SandboxRuntimeConfig;
-    pub use crate::error::{Result, SandboxError, SandboxViolationEvent};
+    pub use crate::error::{Result, SandboxError, SandboxViolationEvent, SandboxViolationKind};
 }

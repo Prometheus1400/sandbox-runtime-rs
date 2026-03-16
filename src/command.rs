@@ -9,7 +9,8 @@ use crate::error::{SandboxError, SandboxViolationEvent, SandboxedExecutionError}
 use crate::manager::network::initialize_proxies;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::{
-    extract_seccomp_runner, generate_bwrap_command_with_runner, generate_socket_path,
+    build_linux_write_policy, extract_seccomp_runner, generate_bwrap_command_with_runner,
+    generate_socket_path,
     LinuxLogMonitor, SocatBridge,
 };
 #[cfg(target_os = "macos")]
@@ -218,30 +219,13 @@ impl SandboxedCommand {
         let output = child.wait_with_output().await?;
         let violations = child.drain_violations().await;
 
-        if !violations.is_empty() && !output.status.success() {
+        if !violations.is_empty() {
             return Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
                 status: Some(output.status),
                 stdout: output.stdout,
                 stderr: output.stderr,
                 violations,
             }));
-        }
-
-        // Heuristic fallback: infer sandbox denial from stderr when no violations were captured
-        if violations.is_empty() && !output.status.success() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            if looks_like_sandbox_denial(&stderr_str) {
-                let synthetic = SandboxViolationEvent::new(format!(
-                    "inferred: process exited with {} and stderr suggests sandbox denial",
-                    output.status
-                ));
-                return Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
-                    status: Some(output.status),
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    violations: vec![synthetic],
-                }));
-            }
         }
 
         Ok(SandboxedOutput {
@@ -408,8 +392,23 @@ impl SandboxedCommand {
         // Clean up runner binary — the child has already exec'd it
         let _ = std::fs::remove_file(&runner_path);
 
-        let monitor =
-            LinuxLogMonitor::start(listener_fd, Some(command.clone()), violations_tx).await?;
+        let (write_policy, write_warnings) = build_linux_write_policy(
+            &self.config.filesystem,
+            &cwd,
+            self.config.ripgrep.as_ref(),
+            self.config.mandatory_deny_search_depth,
+        );
+        for warning in write_warnings {
+            tracing::warn!("{warning}");
+        }
+
+        let monitor = LinuxLogMonitor::start(
+            listener_fd,
+            Some(command.clone()),
+            write_policy,
+            violations_tx,
+        )
+        .await?;
 
         Ok(SandboxedChild {
             stdin: child.stdin.take(),
@@ -458,24 +457,4 @@ fn recv_fd(
     Err(SandboxError::Seccomp(
         "no listener fd received from seccomp runner".into(),
     ))
-}
-
-fn looks_like_sandbox_denial(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    if lower.contains("operation not permitted") {
-        return true;
-    }
-    if lower.contains("sandbox") && lower.contains("deny") {
-        return true;
-    }
-    if lower.contains("permission denied") {
-        return true;
-    }
-    if lower.contains("don't have permission to access") {
-        return true;
-    }
-    if lower.contains("afpaccessdenied") {
-        return true;
-    }
-    false
 }

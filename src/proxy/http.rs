@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{SandboxError, SandboxViolationEvent};
 use crate::proxy::filter::{DomainFilter, FilterDecision};
+use crate::violation::proxy_network_denied_event;
 
 /// HTTP proxy server.
 pub struct HttpProxy {
@@ -170,10 +171,10 @@ async fn handle_connect(
         FilterDecision::Deny => {
             tracing::debug!("Denied CONNECT to {}:{}", host, port);
             let _ = violations_tx
-                .send(SandboxViolationEvent::new(format!(
-                    "proxy: denied connection to {}:{}",
-                    host, port
-                )))
+                .send(proxy_network_denied_event(
+                    "connect",
+                    format!("{}:{}", host, port),
+                ))
                 .await;
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -319,10 +320,10 @@ async fn handle_http(
     if matches!(decision, FilterDecision::Deny) {
         tracing::debug!("Denied HTTP to {}:{}", host, port);
         let _ = violations_tx
-            .send(SandboxViolationEvent::new(format!(
-                "proxy: denied HTTP request to {}:{}",
-                host, port
-            )))
+            .send(proxy_network_denied_event(
+                req.method().to_string(),
+                format!("{}:{}", host, port),
+            ))
             .await;
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
