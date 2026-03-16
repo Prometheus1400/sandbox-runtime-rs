@@ -383,7 +383,7 @@ impl SandboxedCommand {
         );
 
         let mut inner = Command::new("sh");
-        inner.arg("-c").arg(wrapped);
+        inner.arg("-c").arg(&wrapped);
         self.apply_outer_builder(&mut inner, &cwd);
 
         // Clear close-on-exec on child_fd so it survives into the child process
