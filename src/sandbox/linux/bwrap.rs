@@ -131,6 +131,10 @@ pub fn generate_bwrap_command_with_runner(
     )?;
 
     let mut bwrap_args = vec!["bwrap".to_string(), "--unshare-net".to_string()];
+    // Keep the notification socket fd open so the seccomp runner can send the
+    // listener fd back to the parent from inside the sandbox.
+    bwrap_args.push("--sync-fd".to_string());
+    bwrap_args.push(notify_fd.to_string());
     bwrap_args.push("--ro-bind".to_string());
     bwrap_args.push("/".to_string());
     bwrap_args.push("/".to_string());
