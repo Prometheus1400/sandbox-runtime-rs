@@ -18,6 +18,12 @@ pub fn check_bwrap() -> bool {
         .unwrap_or(false)
 }
 
+fn should_unshare_network(config: &SandboxRuntimeConfig) -> bool {
+    !config.network.allowed_domains.is_empty()
+        || !config.network.denied_domains.is_empty()
+        || config.network.mitm_proxy.is_some()
+}
+
 /// Generate the bubblewrap command for sandboxed execution.
 #[allow(clippy::too_many_arguments, dead_code)]
 pub fn generate_bwrap_command(
@@ -41,10 +47,10 @@ pub fn generate_bwrap_command(
     )?;
 
     // Build bwrap arguments
-    let mut bwrap_args = vec![
-        "bwrap".to_string(),
-        "--unshare-net".to_string(), // Network isolation
-    ];
+    let mut bwrap_args = vec!["bwrap".to_string()];
+    if should_unshare_network(config) {
+        bwrap_args.push("--unshare-net".to_string());
+    }
 
     // Start with read-only root filesystem. This must be mounted before
     // synthetic mounts like /dev, /proc, and tmpfs paths so those mounts
@@ -130,7 +136,10 @@ pub fn generate_bwrap_command_with_runner(
         config.mandatory_deny_search_depth,
     )?;
 
-    let mut bwrap_args = vec!["bwrap".to_string(), "--unshare-net".to_string()];
+    let mut bwrap_args = vec!["bwrap".to_string()];
+    if should_unshare_network(config) {
+        bwrap_args.push("--unshare-net".to_string());
+    }
     bwrap_args.push("--ro-bind".to_string());
     bwrap_args.push("/".to_string());
     bwrap_args.push("/".to_string());
@@ -387,6 +396,53 @@ mod tests {
         assert!(
             wrapped.contains("--chdir /tmp/simpleclaw-workspace"),
             "wrapped command should use provided cwd: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_does_not_unshare_network_without_restrictions() {
+        let config = SandboxRuntimeConfig::default();
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+        )
+        .expect("generate_bwrap_command should succeed");
+
+        assert!(
+            !wrapped.contains("--unshare-net"),
+            "wrapped command should not unshare network without network restrictions: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_generate_bwrap_command_unshares_network_with_domain_rules() {
+        let mut config = SandboxRuntimeConfig::default();
+        config.network.allowed_domains.push("example.com".to_string());
+        let cwd = Path::new("/tmp/simpleclaw-workspace");
+
+        let (wrapped, _warnings) = generate_bwrap_command(
+            "pwd",
+            &config,
+            cwd,
+            None,
+            None,
+            3128,
+            1080,
+            Some("/bin/bash"),
+        )
+        .expect("generate_bwrap_command should succeed");
+
+        assert!(
+            wrapped.contains("--unshare-net"),
+            "wrapped command should unshare network when network restrictions are configured: {wrapped}"
         );
     }
 
