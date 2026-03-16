@@ -299,7 +299,7 @@ impl SandboxedCommand {
         )?;
 
         let mut inner = Command::new("sh");
-        inner.arg("-c").arg(wrapped);
+        inner.arg("-c").arg(&wrapped);
         self.apply_outer_builder(&mut inner, &cwd);
 
         let mut child = inner.spawn()?;
@@ -653,6 +653,7 @@ fn summarize_output(bytes: Option<&[u8]>) -> Option<String> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn summarize_text(text: &str, max_len: usize) -> String {
     let sanitized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if sanitized.len() <= max_len {
