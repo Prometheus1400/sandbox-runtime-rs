@@ -5,7 +5,7 @@ use std::process::Stdio;
 
 use crate::child::SandboxedChild;
 use crate::config::SandboxRuntimeConfig;
-use crate::error::{SandboxError, SandboxViolationEvent, SandboxedExecutionError};
+use crate::error::{SandboxError, SandboxViolationEvent, SandboxViolationKind, SandboxedExecutionError};
 use crate::manager::network::initialize_proxies;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::{
@@ -217,7 +217,16 @@ impl SandboxedCommand {
 
         let mut child = self.spawn().await?;
         let output = child.wait_with_output().await?;
-        let violations = child.drain_violations().await;
+        let mut violations = child.drain_violations().await;
+
+        // Stderr heuristic fallback: if the process failed and no violations were
+        // captured by the log monitor, check stderr for sandbox-related messages.
+        // This handles cases where the log stream is too slow or unavailable.
+        if violations.is_empty() && !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr_violations = detect_stderr_violations(&stderr_str);
+            violations.extend(stderr_violations);
+        }
 
         if !violations.is_empty() {
             return Err(SandboxError::ExecutionViolation(SandboxedExecutionError {
@@ -457,4 +466,38 @@ fn recv_fd(
     Err(SandboxError::Seccomp(
         "no listener fd received from seccomp runner".into(),
     ))
+}
+
+/// Sandbox-related error patterns in stderr that indicate a violation occurred
+/// even when the log monitor didn't capture it.
+const STDERR_VIOLATION_PATTERNS: &[&str] = &[
+    "Operation not permitted",
+    "Permission denied",
+    "sandbox-exec: denied",
+];
+
+/// Detect sandbox violations from stderr output as a fallback when the log
+/// monitor doesn't capture violations (e.g., timing issues on CI).
+fn detect_stderr_violations(stderr: &str) -> Vec<SandboxViolationEvent> {
+    let mut violations = Vec::new();
+    for line in stderr.lines() {
+        if STDERR_VIOLATION_PATTERNS
+            .iter()
+            .any(|pattern| line.contains(pattern))
+        {
+            let kind = if line.contains("write") || line.contains("create") {
+                SandboxViolationKind::FilesystemWrite
+            } else {
+                SandboxViolationKind::Unknown
+            };
+            violations.push(
+                SandboxViolationEvent::new(format!("stderr: {}", line)).with_details(
+                    kind,
+                    None::<String>,
+                    None::<String>,
+                ),
+            );
+        }
+    }
+    violations
 }

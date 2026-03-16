@@ -7,7 +7,7 @@ use crate::config::{FilesystemConfig, RipgrepConfig, DANGEROUS_DIRECTORIES, DANG
 use crate::error::SandboxError;
 use crate::utils::{
     contains_glob_chars, find_dangerous_files, is_symlink_outside_boundary,
-    normalize_path_for_sandbox, remove_trailing_glob_suffix,
+    normalize_path_for_sandbox,
 };
 
 /// Bind mount specification.

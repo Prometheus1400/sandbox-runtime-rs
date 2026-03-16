@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config::SandboxRuntimeConfig;
 use crate::error::SandboxError;
 use crate::sandbox::linux::bridge::SocatBridge;
-use crate::sandbox::linux::filesystem::{generate_bind_mounts, BindMount};
+use crate::sandbox::linux::filesystem::generate_bind_mounts;
 use crate::sandbox::linux::seccomp::{get_apply_seccomp_path, get_bpf_path};
 use crate::utils::quote;
 
